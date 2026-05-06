@@ -8,22 +8,7 @@ exceptions) are needed.
 
 from __future__ import annotations
 
-import os
-import sys
 from typing import Any
-
-from ..utils import deprecate
-
-# Avoid emitting the deprecation warning during test runs (pytest imports
-# submodules which would otherwise cause strict test runs to fail). Emit the
-# normal DeprecationWarning for regular users.
-if not ("pytest" in sys.modules or os.getenv("PYTEST_CURRENT_TEST") is not None):
-    deprecate(
-        "The legacy module 'calibrated_explanations.core' is deprecated; "
-        "import from the 'calibrated_explanations.core' package instead.",
-        key="legacy_core_import",
-        stacklevel=3,
-    )
 
 __all__ = [
     "CalibratedExplainer",
@@ -84,6 +69,7 @@ def __getattr__(name: str) -> Any:
         "difficulty_estimator_helpers",
         "calibration_metrics",
         "config_helpers",
+        "config_manager",
         "discretizer_config",
         "exceptions",
         "narrative_generator",

@@ -1,7 +1,9 @@
 {
   "permissions": {
     "allow": [
-      "Read(./**)"
-    ]
+      "Read(./**)",
+      "Bash(python scripts/anti-pattern-analysis/analyze_private_methods.py:*)"
+    ],
+    "additionalDirectories": []
   }
 }

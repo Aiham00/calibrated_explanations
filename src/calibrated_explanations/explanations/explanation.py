@@ -1,20 +1,20 @@
 # pylint: disable=unknown-option-value
 # pylint: disable=too-many-lines, too-many-arguments, invalid-name, too-many-positional-arguments, line-too-long
-"""Module containing classes for storing and visualizing calibrated explanations.
 
-Classes:
-    :class:`.CalibratedExplanation`:
-        Abstract base class for calibrated explanations. Defines the interface and shared functionality for different types of explanations.
+"""Calibrated explanation containers and visualization helpers.
 
-    :class:`.FactualExplanation`:
-        Provides factual explanations for a given instance, highlighting features that contribute to the model's prediction.
+This module defines the classes used to represent factual, alternative and
+fast explanations produced by :class:`~calibrated_explanations.core.CalibratedExplainer`.
 
-    :class:`.AlternativeExplanation`:
-        Offers alternative explanations by exploring how changes to feature values could alter the model's prediction.
-
-    :class:`.FastExplanation`:
-        Represents fast explanations, enabling efficient interpretation of model behavior for large datasets.
+Primary classes
+---------------
+- :class:`CalibratedExplanation` — Abstract base for explanation instances.
+- :class:`FactualExplanation` — Factual explanations for an instance.
+- :class:`AlternativeExplanation` — Alternative/counterfactual explanations.
+- :class:`FastExplanation` — Lightweight fast-mode explanations.
 """
+
+from __future__ import annotations
 
 import contextlib
 import math
@@ -59,8 +59,8 @@ class RuleWithImpact:
     base_predict: float
     predict: float
     value: Any
-    uncertainty_low: Optional[float] = None
-    uncertainty_high: Optional[float] = None
+    weight_envelope_low: Optional[float] = None
+    weight_envelope_high: Optional[float] = None
     predict_low: Optional[float] = None
     predict_high: Optional[float] = None
 
@@ -122,10 +122,11 @@ class RuleWithImpact:
 class CalibratedExplanation(ABC):
     """Abstract base class for storing and visualizing calibrated explanations.
 
-    This class defines the interface and shared functionality for different types of calibrated explanations.
+    Subclasses implement concrete payload building and plotting utilities while
+    this base class provides shared validation and convenience accessors.
 
-    For detailed information about the internal data structures and attributes used by this class
-    and its subclasses, see docs/foundations/concepts/explanation_structures.md.
+    See documentation at ``docs/foundations/concepts/explanation_structures.md``
+    for details on the internal payload layout.
     """
 
     def __init__(
@@ -223,6 +224,95 @@ class CalibratedExplanation(ABC):
         self.reject_context = None
 
         self._validate_prediction_invariant()
+
+    def filter_features(
+        self,
+        *,
+        exclude_features=None,
+        include_features=None,
+        copy=True,
+    ):
+        """Filter rules by feature inclusion or exclusion.
+
+        Parameters
+        ----------
+        exclude_features : str, int, or list of str/int, optional
+            Features to exclude. Rules containing these features will be removed.
+        include_features : str, int, or list of str/int, optional
+            Features to include. Only rules containing these features will be kept.
+        copy : bool, default=True
+            If True, return a copy of the explanation. If False, modify in place.
+
+        Returns
+        -------
+        CalibratedExplanation
+            Filtered explanation.
+        """
+        if (exclude_features is None) == (include_features is None):
+            raise ValidationError(
+                "Exactly one of exclude_features or include_features must be provided",
+                details={
+                    "exclude_features": exclude_features,
+                    "include_features": include_features,
+                },
+            )
+
+        if copy:
+            self = self.copy()
+
+        # Normalize the features to indices
+        target_features = exclude_features if exclude_features is not None else include_features
+        is_exclude = exclude_features is not None
+
+        if isinstance(target_features, (str, int)):
+            target_features = [target_features]
+        elif not isinstance(target_features, list):
+            raise ValidationError("Features must be a string, int, or list of strings/ints")
+
+        if not target_features:
+            raise ValidationError("Features list must not be empty")
+
+        target_indices = []
+        for feat in target_features:
+            if isinstance(feat, str):
+                if feat not in self.get_explainer().feature_names:
+                    raise ValidationError(f"Feature name '{feat}' not found in feature_names")
+                target_indices.append(self.get_explainer().feature_names.index(feat))
+            elif isinstance(feat, int):
+                if not (0 <= feat < self.get_explainer().num_features):
+                    raise ValidationError(
+                        f"Feature index {feat} is out of range [0, {self.get_explainer().num_features})"
+                    )
+                target_indices.append(feat)
+            else:
+                raise ValidationError("Features must contain only strings or ints")
+
+        # Create mask for rules to keep
+        keep_mask = []
+        for i, features in enumerate(self.rules["feature"]):
+            if self.rules["is_conjunctive"][i]:
+                # For conjunctive rules
+                if isinstance(features, list):
+                    has_target = any(f in target_indices for f in features)
+                else:
+                    has_target = features in target_indices
+                keep = has_target if not is_exclude else not has_target
+            else:
+                # For disjunctive rules (single feature)
+                has_target = features in target_indices
+                keep = has_target if not is_exclude else not has_target
+            keep_mask.append(keep)
+
+        # Filter rules
+        filtered_rules = {}
+        for key in self.rules:
+            filtered_rules[key] = [
+                val for val, keep in zip(self.rules[key], keep_mask, strict=False) if keep
+            ]
+
+        self.rules = filtered_rules
+
+        return self
 
     def _validate_prediction_invariant(self) -> None:
         """Enforce low <= predict <= high invariant on prediction payload."""
@@ -595,6 +685,16 @@ class CalibratedExplanation(ABC):
         else:
             # For text and html, return as is
             return result
+
+    def to_dataframe(self, *args, **kwargs):
+        """Return the narrative output as a pandas DataFrame.
+
+        Call :meth:`to_narrative` with ``output_format='dataframe'`` and return
+        the resulting DataFrame. Accepts the same arguments as
+        :meth:`to_narrative`.
+        """
+        kwargs.setdefault("output_format", "dataframe")
+        return self.to_narrative(*args, **kwargs)
 
     @abstractmethod
     def add_conjunctions(self, n_top_features=5, max_rule_size=2):
@@ -1603,7 +1703,7 @@ class FactualExplanation(CalibratedExplanation):
 
         for r in canonical_rules:
             output.append(
-                f"{str(r.value):6}: {r.text:40s} {r.impact:>6.3f} [{r.uncertainty_low:>6.3f}, {r.uncertainty_high:>6.3f}]"
+                f"{str(r.value):6}: {r.text:40s} {r.impact:>6.3f} [{r.weight_envelope_low:>6.3f}, {r.weight_envelope_high:>6.3f}]"
             )
         return "\n".join(output) + "\n"
 
@@ -1785,8 +1885,8 @@ class FactualExplanation(CalibratedExplanation):
                     else float("nan"),
                     predict=float(prediction),
                     value=rules_dict["value"][i],
-                    uncertainty_low=float(rules_dict["weight_low"][i]),
-                    uncertainty_high=float(rules_dict["weight_high"][i]),
+                    weight_envelope_low=float(rules_dict["weight_low"][i]),
+                    weight_envelope_high=float(rules_dict["weight_high"][i]),
                     predict_low=float(rules_dict["predict_low"][i]),
                     predict_high=float(rules_dict["predict_high"][i]),
                 )
@@ -1868,6 +1968,9 @@ class FactualExplanation(CalibratedExplanation):
             and getattr(self, "conjunctive_rules", None) is not None
         ):
             return self.conjunctive_rules
+
+        if getattr(self, "has_rules", False) and isinstance(self.rules, dict):
+            return self.rules
 
         # i = self.index
         instance = np.array(self.x_test, copy=True)
@@ -2239,11 +2342,18 @@ class FactualExplanation(CalibratedExplanation):
             - rnk_weight (float): default=0.5. The weight of the uncertainty in
               the ranking. Used with the 'ensured' ranking metric.
         """
+        requested_style = kwargs.get("style")
+        custom_plot_style = isinstance(requested_style, str) and requested_style not in {
+            "regular",
+            "triangular",
+            "ensured",
+            "narrative",
+        }
         # Ensure style_override gets passed through
         style_override = kwargs.pop("style_override", None)
         plot_use_legacy = kwargs.pop("use_legacy", None)
         # PlotSpec request forces new renderer
-        if kwargs.get("return_plot_spec"):
+        if kwargs.get("return_plot_spec") or custom_plot_style:
             plot_use_legacy = False
         # Phase 2 Option B: Default to legacy to ensure parity until PlotSpec is fully hardened
         elif plot_use_legacy is None:
@@ -2553,8 +2663,8 @@ class AlternativeExplanation(CalibratedExplanation):
                     base_predict=float(base_predict_value),
                     predict=float(rules_dict["predict"][i]),  # Alternative prediction
                     value=rules_dict["value"][i],
-                    uncertainty_low=float(rules_dict["weight_low"][i]),
-                    uncertainty_high=float(rules_dict["weight_high"][i]),
+                    weight_envelope_low=float(rules_dict["weight_low"][i]),
+                    weight_envelope_high=float(rules_dict["weight_high"][i]),
                     predict_low=float(rules_dict["predict_low"][i]),
                     predict_high=float(rules_dict["predict_high"][i]),
                 )
@@ -2683,6 +2793,9 @@ class AlternativeExplanation(CalibratedExplanation):
             and getattr(self, "conjunctive_rules", None) is not None
         ):
             return self.conjunctive_rules
+
+        if getattr(self, "has_rules", False) and isinstance(self.rules, dict):
+            return self.rules
 
         self.rules = []
         self.labels = {}  # pylint: disable=attribute-defined-outside-init
@@ -2834,6 +2947,24 @@ class AlternativeExplanation(CalibratedExplanation):
         """Determine if the explanation is a counter-explanation."""
         return self.__is_counter_explanation
 
+    def __append_rule(self, new_rules, rules, rule):
+        """Append a single rule from *rules* at index *rule* to *new_rules*."""
+        new_rules["predict"].append(rules["predict"][rule])
+        new_rules["predict_low"].append(rules["predict_low"][rule])
+        new_rules["predict_high"].append(rules["predict_high"][rule])
+        new_rules["weight"].append(rules["weight"][rule])
+        new_rules["weight_low"].append(rules["weight_low"][rule])
+        new_rules["weight_high"].append(rules["weight_high"][rule])
+        new_rules["value"].append(rules["value"][rule])
+        new_rules["rule"].append(rules["rule"][rule])
+        new_rules["feature"].append(rules["feature"][rule])
+        new_rules["sampled_values"].append(rules["sampled_values"][rule])
+        if "feature_value" in rules:
+            new_rules["feature_value"].append(rules["feature_value"][rule])
+        else:
+            new_rules["feature_value"].append(None)
+        new_rules["is_conjunctive"].append(rules["is_conjunctive"][rule])
+
     def __filter_rules(
         self,
         only_ensured=False,
@@ -2843,77 +2974,229 @@ class AlternativeExplanation(CalibratedExplanation):
         include_potential=False,
     ):
         """Filter rules based on the explanation type."""
-        if self.is_regression() and not self.is_probabilistic():
-            warnings.warn(
-                "Regression explanations are not probabilistic. Filtering rules may not be effective.",
-                stacklevel=2,
-            )
-        positive_class = self.prediction["predict"] > 0.5
+        is_plain_regression = self.is_regression() and not self.is_probabilistic()
         initial_uncertainty = np.abs(self.prediction["high"] - self.prediction["low"])
 
         new_rules = self.__set_up_result()
         rules = self.get_rules()  # pylint: disable=protected-access
-        for rule in range(len(rules["rule"])):
-            is_potential = rules["predict_low"][rule] < 0.5 < rules["predict_high"][rule]
-            # filter out potential rules if include_potential is False
-            if not include_potential and is_potential:
-                continue
-            if make_super and (
-                positive_class
-                and rules["predict"][rule] <= self.prediction["predict"]
-                or not positive_class
-                and rules["predict"][rule] >= self.prediction["predict"]
-            ):
-                continue
-            if make_semi:
-                if positive_class:
-                    if not (include_potential and is_potential) and (
-                        rules["predict"][rule] < 0.5
-                        or rules["predict"][rule] > self.prediction["predict"]
+
+        if is_plain_regression:
+            # For plain regression, redefine filtering concepts:
+            # - super: higher prediction than original
+            # - semi/counter: lower prediction than original (identical)
+            # - potential: alternative interval covers the original prediction
+            # - ensured: smaller uncertainty interval (unchanged)
+            for rule in range(len(rules["rule"])):
+                is_potential = (
+                    rules["predict_low"][rule]
+                    <= self.prediction["predict"]
+                    <= rules["predict_high"][rule]
+                )
+                if not include_potential and is_potential:
+                    continue
+                # Super: keep only rules with higher prediction
+                if make_super and rules["predict"][rule] <= self.prediction["predict"]:
+                    continue
+                # Semi: for plain regression, keep alternatives where the
+                # uncertainty intervals mutually include the other's mean
+                # (i.e. conservative 'semi' definition). Use predict and
+                # predict_low/predict_high for comparisons.
+                if make_semi:
+                    try:
+                        rule_mean = float(rules["predict"][rule])
+                        rule_low = float(rules["predict_low"][rule])
+                        rule_high = float(rules["predict_high"][rule])
+                        base_mean = float(self.prediction["predict"])
+                        base_low = float(self.prediction["low"])
+                        base_high = float(self.prediction["high"])
+                    except (TypeError, ValueError):
+                        # If values are not numeric, skip this rule
+                        continue
+                    if not (
+                        (rule_low <= base_mean <= rule_high)
+                        and (base_low <= rule_mean <= base_high)
                     ):
                         continue
-                elif not (include_potential and is_potential) and (
-                    rules["predict"][rule] > 0.5
-                    or rules["predict"][rule] < self.prediction["predict"]
+                # Counter: keep only rules with lower prediction than original
+                if make_counter and rules["predict"][rule] >= self.prediction["predict"]:
+                    continue
+                if (
+                    only_ensured
+                    and rules["predict_high"][rule] - rules["predict_low"][rule]
+                    > initial_uncertainty
                 ):
                     continue
-            if make_counter and (
-                not (include_potential and is_potential)
-                and (
-                    positive_class
-                    and rules["predict"][rule] > 0.5
-                    or not positive_class
-                    and rules["predict"][rule] < 0.5
+                if (
+                    rules["base_predict_low"] == rules["predict_low"][rule]
+                    and rules["base_predict_high"] == rules["predict_high"][rule]
+                    and rules["predict"][rule] == self.prediction["predict"]
+                ):
+                    continue
+                self.__append_rule(new_rules, rules, rule)
+        else:
+            positive_class = self.prediction["predict"] > 0.5
+            for rule in range(len(rules["rule"])):
+                is_potential = rules["predict_low"][rule] < 0.5 < rules["predict_high"][rule]
+                # filter out potential rules if include_potential is False
+                if not include_potential and is_potential:
+                    continue
+                # Compute point-based membership (always enforced).
+                rule_predict = rules["predict"][rule]
+                # super: moves further into the predicted class (away from 0.5)
+                is_super_by_point = (
+                    positive_class and rule_predict > self.prediction["predict"]
+                ) or (not positive_class and rule_predict < self.prediction["predict"])
+                # semi: same side as base but closer to the decision boundary (towards 0.5)
+                if positive_class:
+                    is_semi_by_point = (rule_predict > 0.5) and (
+                        rule_predict < self.prediction["predict"]
+                    )
+                else:
+                    is_semi_by_point = (rule_predict < 0.5) and (
+                        rule_predict > self.prediction["predict"]
+                    )
+                # counter: crosses the decision boundary (opposite side of 0.5)
+                is_counter_by_point = (positive_class and rule_predict <= 0.5) or (
+                    not positive_class and rule_predict >= 0.5
                 )
-            ):
+
+                # Enforce membership by point-prediction for all modes. Potentials
+                # are still controlled by the `include_potential` flag above, but
+                # when included they must also satisfy the point-based comparator.
+                if make_super and not is_super_by_point:
+                    continue
+                if make_semi and not is_semi_by_point:
+                    continue
+                if make_counter and not is_counter_by_point:
+                    continue
+                # if only_ensured is True, filter out rules that lead to increased uncertainty
+                if (
+                    only_ensured
+                    and rules["predict_high"][rule] - rules["predict_low"][rule]
+                    > initial_uncertainty
+                ):
+                    continue
+                # filter out rules that does not provide a different prediction
+                if (
+                    rules["base_predict_low"] == rules["predict_low"][rule]
+                    and rules["base_predict_high"] == rules["predict_high"][rule]
+                ):
+                    continue
+                self.__append_rule(new_rules, rules, rule)
+
+        new_rules["classes"] = rules["classes"]
+
+        if self.has_conjunctive_rules:  # pylint: disable=protected-access
+            self.__extracted_non_conjunctive_rules(new_rules)
+        self.rules = new_rules
+        return self
+
+    def __pareto_rule_indexes(self, rules, *, pareto_cost: str):
+        """Return rule indices on the output-envelope Pareto frontier.
+
+        The output value (probability for classification or calibrated output
+        for regression) is treated as the coverage axis, while the Pareto
+        *cost* dimension is minimized.
+
+        Supported Pareto cost dimensions:
+
+        - ``"uncertainty_width"``: minimize interval width (``high - low``).
+        - ``"rule_size"``: minimize number of features changed in the rule
+          (1 for atomic rules; >1 for conjunctive rules).
+        """
+        rule_count = len(rules.get("rule", []))
+        if rule_count <= 1:
+            return list(range(rule_count))
+
+        def _rule_size(feature: Any) -> float:
+            if isinstance(feature, (list, tuple, np.ndarray)):
+                return float(len(np.asarray(feature).ravel()))
+            return 1.0
+
+        def _rule_cost(index: int) -> float:
+            if pareto_cost == "uncertainty_width":
+                return float(rules["predict_high"][index]) - float(rules["predict_low"][index])
+            if pareto_cost == "rule_size":
+                features = rules.get("feature", [])
+                feature_value = features[index] if index < len(features) else None
+                return _rule_size(feature_value)
+            raise ValidationError(
+                "pareto_cost must be one of: uncertainty_width, rule_size",
+                details={"pareto_cost": pareto_cost},
+            )
+
+        tolerance = 1e-12
+        best_per_output = {}
+        for index in range(rule_count):
+            output_value = float(rules["predict"][index])
+            cost_value = _rule_cost(index)
+            output_key = round(output_value, 12)
+
+            current_best = best_per_output.get(output_key)
+            if current_best is None:
+                best_per_output[output_key] = {
+                    "index": index,
+                    "output": output_value,
+                    "cost": cost_value,
+                }
                 continue
-            # if only_ensured is True, filter out rules that lead to increased uncertainty
+
             if (
-                only_ensured
-                and rules["predict_high"][rule] - rules["predict_low"][rule] > initial_uncertainty
+                cost_value < current_best["cost"] - tolerance
+                or math.isclose(
+                    cost_value,
+                    current_best["cost"],
+                    rel_tol=tolerance,
+                    abs_tol=tolerance,
+                )
+                and index < current_best["index"]
             ):
-                continue
-            # filter out rules that does not provide a different prediction
+                best_per_output[output_key] = {
+                    "index": index,
+                    "output": output_value,
+                    "cost": cost_value,
+                }
+
+        candidates = sorted(best_per_output.values(), key=lambda candidate: candidate["output"])
+        if len(candidates) <= 2:
+            return sorted(candidate["index"] for candidate in candidates)
+
+        left_mins = []
+        running_left_min = float("inf")
+        for candidate in candidates:
+            running_left_min = min(running_left_min, candidate["cost"])
+            left_mins.append(running_left_min)
+
+        right_mins = [0.0] * len(candidates)
+        running_right_min = float("inf")
+        for reverse_index in range(len(candidates) - 1, -1, -1):
+            running_right_min = min(running_right_min, candidates[reverse_index]["cost"])
+            right_mins[reverse_index] = running_right_min
+
+        kept_indexes = {
+            candidates[0]["index"],
+            candidates[-1]["index"],
+        }
+        for position, candidate in enumerate(candidates):
+            cost_value = candidate["cost"]
             if (
-                rules["base_predict_low"] == rules["predict_low"][rule]
-                and rules["base_predict_high"] == rules["predict_high"][rule]
+                cost_value <= left_mins[position] + tolerance
+                or cost_value <= right_mins[position] + tolerance
             ):
+                kept_indexes.add(candidate["index"])
+
+        return sorted(kept_indexes)
+
+    def __pareto_filter_rules(self, *, pareto_cost: str):
+        """Reduce current rules to the output-envelope Pareto frontier."""
+        rules = self.get_rules()  # pylint: disable=protected-access
+        pareto_indexes = set(self.__pareto_rule_indexes(rules, pareto_cost=pareto_cost))
+
+        new_rules = self.__set_up_result()
+        for rule in range(len(rules.get("rule", []))):
+            if rule not in pareto_indexes:
                 continue
-            new_rules["predict"].append(rules["predict"][rule])
-            new_rules["predict_low"].append(rules["predict_low"][rule])
-            new_rules["predict_high"].append(rules["predict_high"][rule])
-            new_rules["weight"].append(rules["weight"][rule])
-            new_rules["weight_low"].append(rules["weight_low"][rule])
-            new_rules["weight_high"].append(rules["weight_high"][rule])
-            new_rules["value"].append(rules["value"][rule])
-            new_rules["rule"].append(rules["rule"][rule])
-            new_rules["feature"].append(rules["feature"][rule])
-            new_rules["sampled_values"].append(rules["sampled_values"][rule])
-            if "feature_value" in rules:
-                new_rules["feature_value"].append(rules["feature_value"][rule])
-            else:
-                new_rules["feature_value"].append(None)
-            new_rules["is_conjunctive"].append(rules["is_conjunctive"][rule])
+            self.__append_rule(new_rules, rules, rule)
         new_rules["classes"] = rules["classes"]
 
         if self.has_conjunctive_rules:  # pylint: disable=protected-access
@@ -2992,21 +3275,49 @@ class AlternativeExplanation(CalibratedExplanation):
         return self
 
     def super_explanations(self, only_ensured=False, include_potential=True, copy=True):
-        """
-        Provide super-explanations that support the predicted class.
+        """Return a filtered view of *super* alternative explanations.
+
+        A *super* alternative reinforces the model's current prediction.
 
         Parameters
         ----------
         only_ensured : bool, default=False
-            Determines whether to return only ensured explanations.
+            When ``True``, keep only alternatives whose uncertainty interval is
+            no wider than the base prediction interval.
         include_potential : bool, default=True
-            Determines whether to include potential explanations in the super-explanations.
+            Whether to include *potential* alternatives.
         copy : bool, default=True
-            Determines whether to return a copy of the explanation or modify it in place.
+            When ``True``, return a new :class:`.AlternativeExplanation`.
+            When ``False``, filter in place.
 
         Returns
         -------
         :class:`.AlternativeExplanation`
+            The filtered alternative explanation.
+
+        Notes
+        -----
+        The definition of "super" depends on the task mode:
+
+        - **Classification / probabilistic regression**: Treat the output as a
+          calibrated probability with a 0.5 decision boundary. Let
+          ``p_base = prediction['predict']``.
+
+          - If ``p_base > 0.5`` (predicted positive/event), keep alternatives
+            with ``p_rule > p_base``.
+          - Otherwise, keep alternatives with ``p_rule < p_base``.
+
+        - **Plain regression**: Treat the output as a calibrated numeric value.
+          Keep alternatives with a higher predicted output than the base.
+
+        Potential alternatives are those where the uncertainty interval spans
+        the decision boundary (classification / probabilistic regression) or
+        covers the base prediction (plain regression).
+
+        Examples
+        --------
+        >>> alternatives = explainer.explore_alternatives(x_query)
+        >>> super_alts = alternatives[0].super_explanations()
         """
         target = self.copy() if copy else self
         target.__filter_rules(
@@ -3015,22 +3326,49 @@ class AlternativeExplanation(CalibratedExplanation):
         target._AlternativeExplanation__is_super_explanation = True  # pylint: disable=protected-access
         return target
 
+    def super(self, only_ensured=False, include_potential=True, copy=True):
+        """Shorthand delegator for :meth:`.super_explanations`."""
+        return self.super_explanations(
+            only_ensured=only_ensured, include_potential=include_potential, copy=copy
+        )
+
     def semi_explanations(self, only_ensured=False, include_potential=True, copy=True):
-        """
-        Provide semi-explanations that partially support the predicted class.
+        """Return a filtered view of *semi* alternative explanations.
+
+        A *semi* alternative moves the prediction toward the decision boundary
+        without crossing it (classification/probabilistic regression) or moves
+        the regression output in the opposite direction of a *super*
+        alternative (plain regression).
 
         Parameters
         ----------
         only_ensured : bool, default=False
-            Determines whether to return only ensured explanations.
+            When ``True``, keep only alternatives whose uncertainty interval is
+            no wider than the base prediction interval.
         include_potential : bool, default=True
-            Determines whether to include potential explanations in the semi-explanations.
+            Whether to include *potential* alternatives.
         copy : bool, default=True
-            Determines whether to return a copy of the explanation or modify it in place.
+            When ``True``, return a new :class:`.AlternativeExplanation`.
+            When ``False``, filter in place.
 
         Returns
         -------
         :class:`.AlternativeExplanation`
+            The filtered alternative explanation.
+
+        Notes
+        -----
+        - **Classification / probabilistic regression**: Semi alternatives stay
+          on the *same side* of the 0.5 boundary as the base prediction, but are
+          closer to that boundary than the base (unless marked as potential and
+          ``include_potential=True``).
+        - **Plain regression**: Semi alternatives keep rules with a lower
+          predicted output than the base prediction.
+
+        Examples
+        --------
+        >>> alternatives = explainer.explore_alternatives(x_query)
+        >>> semi_alts = alternatives[0].semi_explanations()
         """
         target = self.copy() if copy else self
         target.__filter_rules(
@@ -3039,22 +3377,49 @@ class AlternativeExplanation(CalibratedExplanation):
         target._AlternativeExplanation__is_semi_explanation = True  # pylint: disable=protected-access
         return target
 
+    def semi(self, only_ensured=False, include_potential=True, copy=True):
+        """Shorthand delegator for :meth:`.semi_explanations`."""
+        return self.semi_explanations(
+            only_ensured=only_ensured, include_potential=include_potential, copy=copy
+        )
+
     def counter_explanations(self, only_ensured=False, include_potential=True, copy=True):
-        """
-        Provide counter-explanations that do not support the predicted class.
+        """Return a filtered view of *counter* alternative explanations.
+
+        A *counter* alternative opposes the model's current prediction.
 
         Parameters
         ----------
         only_ensured : bool, default=False
-            Determines whether to return only ensured explanations.
+            When ``True``, keep only alternatives whose uncertainty interval is
+            no wider than the base prediction interval.
         include_potential : bool, default=True
-            Determines whether to include potential explanations in the counter-explanations.
+            Whether to include *potential* alternatives.
         copy : bool, default=True
-            Determines whether to return a copy of the explanation or modify it in place.
+            When ``True``, return a new :class:`.AlternativeExplanation`.
+            When ``False``, filter in place.
 
         Returns
         -------
         :class:`.AlternativeExplanation`
+            The filtered alternative explanation.
+
+        Notes
+        -----
+        - **Classification / probabilistic regression**: Counter alternatives
+          cross the 0.5 decision boundary. For a base prediction
+          ``p_base > 0.5`` they keep rules with ``p_rule <= 0.5`` (and
+          vice-versa).
+        - **Plain regression**: Counter alternatives keep rules with a lower
+          predicted output than the base prediction.
+
+        In plain regression, :meth:`.semi_explanations` and
+        :meth:`.counter_explanations` currently have the same output semantics.
+
+        Examples
+        --------
+        >>> alternatives = explainer.explore_alternatives(x_query)
+        >>> counter_alts = alternatives[0].counter_explanations()
         """
         target = self.copy() if copy else self
         target.__filter_rules(
@@ -3063,24 +3428,102 @@ class AlternativeExplanation(CalibratedExplanation):
         target._AlternativeExplanation__is_counter_explanation = True  # pylint: disable=protected-access
         return target
 
+    def counter(self, only_ensured=False, include_potential=True, copy=True):
+        """Shorthand delegator for :meth:`.counter_explanations`."""
+        return self.counter_explanations(
+            only_ensured=only_ensured, include_potential=include_potential, copy=copy
+        )
+
     def ensured_explanations(self, include_potential=True, copy=True):
-        """
-        Provide ensured explanations with smaller confidence intervals.
+        """Return a filtered view of *ensured* alternative explanations.
+
+        Ensured alternatives are those whose uncertainty interval is no wider
+        than the base prediction interval.
 
         Parameters
         ----------
         include_potential : bool, default=True
-            Determines whether to include potential explanations in the ensured explanations.
+            Whether to include *potential* alternatives.
         copy : bool, default=True
-            Determines whether to return a copy of the explanation or modify it in place.
+            When ``True``, return a new :class:`.AlternativeExplanation`.
+            When ``False``, filter in place.
 
         Returns
         -------
         :class:`.AlternativeExplanation`
+            The filtered alternative explanation.
+
+        Notes
+        -----
+        This method is task-agnostic: it filters by *uncertainty interval width*
+        only and therefore works for classification, probabilistic regression,
+        and plain regression.
+
+        Examples
+        --------
+        >>> alternatives = explainer.explore_alternatives(x_query)
+        >>> ensured = alternatives[0].ensured_explanations()
         """
         target = self.copy() if copy else self
         target.__filter_rules(only_ensured=True, include_potential=include_potential)
         return target
+
+    def ensured(self, include_potential=True, copy=True):
+        """Shorthand delegator for :meth:`.ensured_explanations`."""
+        return self.ensured_explanations(include_potential=include_potential, copy=copy)
+
+    def pareto_explanations(
+        self,
+        include_potential: bool = True,
+        copy: bool = True,
+        *,
+        pareto_cost: Literal["uncertainty_width", "rule_size"] = "uncertainty_width",
+    ):
+        """Return output-envelope Pareto alternatives.
+
+        Parameters
+        ----------
+        include_potential : bool, default=True
+            Determines whether to include potential explanations before
+            extracting the Pareto frontier.
+        copy : bool, default=True
+            Determines whether to return a copy of the explanation or modify it
+            in place.
+        pareto_cost : {"uncertainty_width", "rule_size"}, default="uncertainty_width"
+            The dimension minimized along the output axis when selecting the
+            frontier. ``"uncertainty_width"`` reproduces the historical behavior
+            (minimize interval width). ``"rule_size"`` minimizes the number of
+            changed features in the rule (useful when conjunctions are present).
+
+        Returns
+        -------
+        :class:`.AlternativeExplanation`
+
+        Notes
+        -----
+        Pareto filtering keeps an output-envelope frontier where no alternative
+        can reduce the chosen Pareto cost without changing the output.
+        The output axis is the calibrated probability (classification /
+        probabilistic regression) or the calibrated numeric output (regression).
+        """
+        target = self.copy() if copy else self
+        target.__filter_rules(include_potential=include_potential)
+        target.__pareto_filter_rules(pareto_cost=pareto_cost)
+        return target
+
+    def pareto(
+        self,
+        include_potential: bool = True,
+        copy: bool = True,
+        *,
+        pareto_cost: Literal["uncertainty_width", "rule_size"] = "uncertainty_width",
+    ):
+        """Shorthand delegator for :meth:`.pareto_explanations`."""
+        return self.pareto_explanations(
+            include_potential=include_potential,
+            copy=copy,
+            pareto_cost=pareto_cost,
+        )
 
     def add_conjunctions(self, n_top_features=5, max_rule_size=2, **kwargs):
         """
@@ -3388,17 +3831,25 @@ class AlternativeExplanation(CalibratedExplanation):
                 The `style` parameter is a string that determines the style of the plot. Possible styles are for :class:`.AlternativeExplanation`:
 
                 * 'regular' - a regular plot with feature weights and uncertainty intervals (if applicable)
-                * 'triangular' - a triangular plot for alternative explanations highlighting the interplay between the calibrated probability and the uncertainty intervals
+                * 'triangular' - a triangular plot for alternative explanations highlighting the interplay between the prediction and the uncertainty intervals
+                * 'ensured' - alias for 'triangular' (intended for ensured-style alternative interpretation)
             rnk_metric : str, default='ensured'
                 The metric used to rank the features. Supported metrics are 'ensured', 'feature_weight', and 'uncertainty'.
             rnk_weight : float, default=0.5
                 The weight of the uncertainty in the ranking. Used with the 'ensured' ranking metric.
         """
+        requested_style = kwargs.get("style")
+        custom_plot_style = isinstance(requested_style, str) and requested_style not in {
+            "regular",
+            "triangular",
+            "ensured",
+            "narrative",
+        }
         # Ensure style_override gets passed through
         style_override = kwargs.pop("style_override", None)
         plot_use_legacy = kwargs.pop("use_legacy", None)
         # PlotSpec request forces new renderer
-        if kwargs.get("return_plot_spec"):
+        if kwargs.get("return_plot_spec") or custom_plot_style:
             plot_use_legacy = False
         # Phase 2 Option B: Default to legacy to ensure parity until PlotSpec is fully hardened
         elif plot_use_legacy is None:
@@ -3491,7 +3942,12 @@ class AlternativeExplanation(CalibratedExplanation):
         # Adjust the number to show after filtering
         num_to_show_filtered = min(num_to_show_, len(features_to_plot))
 
-        if "style" in kwargs and kwargs["style"] == "triangular":
+        style = kwargs.get("style")
+        if style == "ensured":
+            kwargs["style"] = "triangular"
+            style = "triangular"
+
+        if style == "triangular":
             proba = predict["predict"]
             # Uncertainty is the calibrated interval width (high-low).
             # Keep semantics consistent with ADR-021 and other plot styles.
@@ -3783,7 +4239,7 @@ class FastExplanation(CalibratedExplanation):
             uncertainty : bool, default=False
                 The `uncertainty` parameter is a boolean flag that determines whether to plot the uncertainty
                 intervals for the feature weights. If `uncertainty` is set to `True`, the plot will show the
-                range of possible feature weights based on the lower and upper bounds of the uncertainty
+                envelope of possible boundary shifts based on the lower and upper bounds of the uncertainty
                 intervals. If `uncertainty` is set to `False`, the plot will only show the feature weights
             style : str, default='regular'
                 The `style` parameter is a string that determines the style of the plot. Possible styles are for :class:`.FastExplanation`:

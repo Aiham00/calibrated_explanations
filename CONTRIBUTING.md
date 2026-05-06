@@ -2,6 +2,12 @@
 
 This project separates a lean core install from optional extras for visualization, notebooks and evaluation. The guidelines below explain how to work with the extras and run tests with or without them.
 
+Repository authority
+--------------------
+
+- `kristinebergs/calibrated_explanations` is an active development mirror for implementation work.
+- `Moffran/calibrated_explanations` is authoritative for versions, tags, GitHub releases, PyPI publication, changelog, security advisories, and published documentation.
+
 - Core install (recommended for development of core features):
 
 ```powershell
@@ -81,6 +87,12 @@ Style guardrails
 - Naming and documentation conventions are enforced in CI (Ruff naming + pydocstyle).
 - Review the quick-reference checklist in `.github/CONTRIBUTING.md` before
   submitting changes that touch public APIs or new modules.
+- Run naming guardrails locally with `pre-commit run ruff-naming --all-files`
+  (or `ruff check --select N`) before opening a PR.
+- Legacy API contract updates are required for user-facing API changes:
+  update `docs/improvement/legacy_user_api_contract.md`,
+  `tests/unit/api/test_legacy_user_api_contract.py`, and
+  `docs/improvement/release_checklist.md` in the same PR (ADR-020).
 
 Logging and Observability
 -------------------------

@@ -7,7 +7,9 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from calibrated_explanations.core.config_manager import ConfigManager
 from calibrated_explanations.parallel import ParallelConfig, ParallelExecutor
+from tests.helpers.deprecation import deprecations_error_enabled
 
 
 @pytest.fixture
@@ -28,6 +30,11 @@ class TestParallelConfig:
 
     def test_perf_parallel_shim_warns_and_forwards(self, clean_env):
         """Deprecated perf shim should forward to canonical parallel module."""
+        if deprecations_error_enabled():
+            with pytest.raises(DeprecationWarning, match="calibrated_explanations.perf.parallel"):
+                importlib.reload(importlib.import_module("calibrated_explanations.perf.parallel"))
+            return
+
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", DeprecationWarning)
             shim = importlib.reload(
@@ -51,15 +58,15 @@ class TestParallelConfig:
     def test_from_env_enable_flag(self, clean_env):
         """Test enabling via simple flag."""
         os.environ["CE_PARALLEL"] = "1"
-        cfg = ParallelConfig.from_env()
+        cfg = ParallelConfig.from_env(config_manager=ConfigManager.from_sources())
         assert cfg.enabled
 
         os.environ["CE_PARALLEL"] = "true"
-        cfg = ParallelConfig.from_env()
+        cfg = ParallelConfig.from_env(config_manager=ConfigManager.from_sources())
         assert cfg.enabled
 
         os.environ["CE_PARALLEL"] = "on"
-        cfg = ParallelConfig.from_env()
+        cfg = ParallelConfig.from_env(config_manager=ConfigManager.from_sources())
         assert cfg.enabled
 
     def test_from_env_disable_flag(self, clean_env):
@@ -67,13 +74,13 @@ class TestParallelConfig:
         os.environ["CE_PARALLEL"] = "0"
         # Start with enabled base
         base = ParallelConfig(enabled=True)
-        cfg = ParallelConfig.from_env(base)
+        cfg = ParallelConfig.from_env(base, config_manager=ConfigManager.from_sources())
         assert not cfg.enabled
 
     def test_from_env_complex_string(self, clean_env):
         """Test parsing complex config strings."""
         os.environ["CE_PARALLEL"] = "enable,workers=4,min_batch=100,tiny=24,joblib"
-        cfg = ParallelConfig.from_env()
+        cfg = ParallelConfig.from_env(config_manager=ConfigManager.from_sources())
         assert cfg.enabled
         assert cfg.max_workers == 4
         assert cfg.min_batch_size == 100
@@ -83,7 +90,7 @@ class TestParallelConfig:
     def test_from_env_granularity(self, clean_env):
         """Test granularity parsing."""
         os.environ["CE_PARALLEL"] = "granularity=instance"
-        cfg = ParallelConfig.from_env()
+        cfg = ParallelConfig.from_env(config_manager=ConfigManager.from_sources())
         assert cfg.granularity == "instance"
 
 
@@ -100,6 +107,7 @@ class TestParallelExecutor:
             patch("os.cpu_count", return_value=4),
             patch("calibrated_explanations.parallel.parallel._JoblibParallel", new=MagicMock()),
             patch.object(ParallelExecutor, "_is_ci_environment", return_value=False),
+            patch.object(ParallelExecutor, "get_cgroup_cpu_quota", return_value=None),
         ):
             strategy = executor.resolve_strategy()
             assert strategy.func == executor.joblib_strategy

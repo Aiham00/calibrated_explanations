@@ -5,6 +5,7 @@ import sys
 import numpy as np
 
 from calibrated_explanations.cache.explanation_cache import ExplanationCacheFacade
+from calibrated_explanations.core.config_manager import ConfigManager
 
 
 def fresh_cache_module():
@@ -19,11 +20,11 @@ def test_cacheconfig_from_env_and_calibrator_cache(monkeypatch, tmp_path):
     cache_mod = fresh_cache_module()
     # Ensure env parsing toggles enabled
     monkeypatch.setenv("CE_CACHE", "1")
-    cfg = cache_mod.CacheConfig.from_env()
+    cfg = cache_mod.CacheConfig.from_env(config_manager=ConfigManager.from_sources())
     assert cfg.enabled is True
 
     monkeypatch.setenv("CE_CACHE", "namespace=foo,version=v2,max_items=3,max_bytes=1024,ttl=0.01")
-    cfg2 = cache_mod.CacheConfig.from_env()
+    cfg2 = cache_mod.CacheConfig.from_env(config_manager=ConfigManager.from_sources())
     assert cfg2.namespace == "foo"
     assert cfg2.version == "v2"
     assert cfg2.max_items == 3
@@ -179,3 +180,17 @@ def test_explanation_cache_facade_enabled_roundtrip():
 
     facade.reset_version("v2")
     assert cal.version == "v2"
+
+
+def test_explanation_cache_facade_enabled_compute_uses_cache_compute():
+    cache_mod = fresh_cache_module()
+    cfg = cache_mod.CacheConfig(enabled=True)
+    cal = cache_mod.CalibratorCache(cfg)
+    facade = ExplanationCacheFacade(cal)
+
+    result = facade.compute_calibration_summaries(
+        explainer_id="x",
+        x_cal_hash="h",
+        compute_fn=lambda: ({0: {"a": 1}}, {0: np.array([1.0])}),
+    )
+    assert result[0][0]["a"] == 1

@@ -8,6 +8,14 @@ import pytest
 from calibrated_explanations.utils.exceptions import ValidationError
 from calibrated_explanations.plugins import registry
 from tests.helpers.deprecation import warns_or_raises, deprecations_error_enabled
+from tests.support.registry_helpers import (
+    clear_explanation_plugins,
+    clear_env_trust_cache,
+    clear_interval_plugins,
+    clear_plot_plugins,
+    clear_trust_warnings,
+    get_entrypoint_group,
+)
 
 
 class FakeEntryPoint:
@@ -15,7 +23,7 @@ class FakeEntryPoint:
         self.name = plugin.plugin_meta["name"]
         self.module = "tests.plugins.fake"
         self.attr = None
-        self.group = registry.get_entrypoint_group()
+        self.group = get_entrypoint_group()
         self.plugin_instance = plugin
 
     def load(self):
@@ -36,25 +44,31 @@ def test_register_and_find_example_plugin(tmp_path, monkeypatch):
     registry.clear()
 
     # Register and find
-    registry.register(plugin)
+    with pytest.warns(DeprecationWarning, match="register\\(\\) is deprecated"):
+        registry.register(plugin)
     all_plugins = registry.list_plugins()
     assert plugin in all_plugins
 
     # find_for should return plugin for supported models
-    found = registry.find_for("supported-model")
+    with pytest.warns(DeprecationWarning, match="find_for\\(\\) is deprecated"):
+        found = registry.find_for("supported-model")
     assert plugin in found
 
     # Not supported model should return empty
-    assert registry.find_for("unsupported") == ()
+    with pytest.warns(DeprecationWarning, match="find_for\\(\\) is deprecated"):
+        assert registry.find_for("unsupported") == ()
 
     # Mark as trusted and ensure trusted discovery returns it
-    registry.trust_plugin(plugin)
-    trusted = registry.find_for_trusted("supported-model")
+    with pytest.warns(DeprecationWarning, match="trust_plugin\\(\\) is deprecated"):
+        registry.trust_plugin(plugin)
+    with pytest.warns(DeprecationWarning, match="find_for_trusted\\(\\) is deprecated"):
+        trusted = registry.find_for_trusted("supported-model")
     assert plugin in trusted
 
     # Untrust and ensure it's not returned by trusted finder
     registry.untrust_plugin(plugin)
-    assert plugin not in registry.find_for_trusted("supported-model")
+    with pytest.warns(DeprecationWarning, match="find_for_trusted\\(\\) is deprecated"):
+        assert plugin not in registry.find_for_trusted("supported-model")
 
     # Unregister removes the plugin
     registry.unregister(plugin)
@@ -83,23 +97,30 @@ def test_register_and_trust_flow(tmp_path):
     p = DummyPlugin()
     # ensure clean start
     registry.clear()
-    registry.register(p)
+    with pytest.warns(DeprecationWarning, match="register\\(\\) is deprecated"):
+        registry.register(p)
     assert p in registry.list_plugins()
     assert p not in registry.list_plugins(include_untrusted=False)
 
     # trusting unregistered plugin raises
-    with pytest.raises(ValidationError):
+    with (
+        pytest.raises(ValidationError),
+        pytest.warns(DeprecationWarning, match="trust_plugin\\(\\) is deprecated"),
+    ):
         registry.trust_plugin(object())
 
     # trust and find
-    registry.trust_plugin(p)
+    with pytest.warns(DeprecationWarning, match="trust_plugin\\(\\) is deprecated"):
+        registry.trust_plugin(p)
     assert p in registry.list_plugins(include_untrusted=False)
-    trusted = registry.find_for_trusted(types.SimpleNamespace(is_dummy=True))
+    with pytest.warns(DeprecationWarning, match="find_for_trusted\\(\\) is deprecated"):
+        trusted = registry.find_for_trusted(types.SimpleNamespace(is_dummy=True))
     assert p in trusted
 
     # untrust works
     registry.untrust_plugin("dummy")
-    trusted2 = registry.find_for_trusted(types.SimpleNamespace(is_dummy=True))
+    with pytest.warns(DeprecationWarning, match="find_for_trusted\\(\\) is deprecated"):
+        trusted2 = registry.find_for_trusted(types.SimpleNamespace(is_dummy=True))
     assert p not in trusted2
     assert p not in registry.list_plugins(include_untrusted=False)
 
@@ -133,7 +154,7 @@ class ExampleExplanationPlugin:
 
 def test_register_explanation_plugin_descriptor():
     registry.clear()
-    registry.clear_explanation_plugins()
+    clear_explanation_plugins()
     plugin = ExampleExplanationPlugin()
     descriptor = registry.register_explanation_plugin("core.explanation.example", plugin)
     registry.mark_explanation_trusted("core.explanation.example")
@@ -149,7 +170,7 @@ def test_register_explanation_plugin_descriptor():
 
 
 def test_register_explanation_plugin_requires_tasks():
-    registry.clear_explanation_plugins()
+    clear_explanation_plugins()
 
     class NoTasksExplanationPlugin:
         plugin_meta = {
@@ -168,7 +189,7 @@ def test_register_explanation_plugin_requires_tasks():
 
 
 def test_register_explanation_plugin_translates_aliases():
-    registry.clear_explanation_plugins()
+    clear_explanation_plugins()
 
     class LegacyModePlugin:
         plugin_meta = {
@@ -194,7 +215,7 @@ def test_register_explanation_plugin_translates_aliases():
 
 
 def test_register_explanation_plugin_schema_version_future():
-    registry.clear_explanation_plugins()
+    clear_explanation_plugins()
 
     class FuturePlugin:
         plugin_meta = {
@@ -252,7 +273,7 @@ class ExampleIntervalPlugin:
 
 
 def test_register_interval_plugin_descriptor():
-    registry.clear_interval_plugins()
+    clear_interval_plugins()
     descriptor = registry.register_interval_plugin("core.interval.example", ExampleIntervalPlugin())
     assert descriptor.identifier == "core.interval.example"
     assert registry.find_interval_plugin("core.interval.example") is descriptor.plugin
@@ -260,7 +281,7 @@ def test_register_interval_plugin_descriptor():
 
 
 def test_register_interval_plugin_requires_modes():
-    registry.clear_interval_plugins()
+    clear_interval_plugins()
 
     class BadIntervalPlugin:
         plugin_meta = {
@@ -312,7 +333,7 @@ class ExamplePlotRenderer:
 
 
 def test_register_plot_plugin_combines_builder_and_renderer():
-    registry.clear_plot_plugins()
+    clear_plot_plugins()
 
     class CombinedPlugin:
         plugin_meta = {
@@ -338,35 +359,40 @@ def test_register_plot_plugin_combines_builder_and_renderer():
 
     plugin = CombinedPlugin()
     try:
-        if deprecations_error_enabled():
-            with pytest.raises(DeprecationWarning):
-                registry.register_plot_plugin("example.plot.combined", plugin)
-        else:
-            with warns_or_raises():
-                descriptor = registry.register_plot_plugin(
-                    "example.plot.combined", plugin, source="builtin"
-                )
-            assert descriptor.identifier == "example.plot.combined"
-            assert registry.find_plot_builder("example.plot.combined") is plugin
-            assert registry.find_plot_renderer("example.plot.combined") is plugin
+        descriptor = registry.register_plot_builder(
+            "example.plot.combined", plugin, source="builtin"
+        )
+        registry.register_plot_renderer("example.plot.combined", plugin, source="builtin")
+        registry.register_plot_style(
+            "example.plot.combined",
+            metadata={
+                "style": "example.plot.combined",
+                "builder_id": "example.plot.combined",
+                "renderer_id": "example.plot.combined",
+                "fallbacks": (),
+            },
+        )
+        assert descriptor.identifier == "example.plot.combined"
+        assert registry.find_plot_builder("example.plot.combined") is plugin
+        assert registry.find_plot_renderer("example.plot.combined") is plugin
 
-            combined = registry.find_plot_plugin("example.plot.combined")
-            assert combined is not None
-            assert combined.plugin_meta is plugin.plugin_meta
-            assert combined.build(1, foo=2) == ("build", (1,), {"foo": 2})
-            assert combined.render(3, bar=4) == ("render", (3,), {"bar": 4})
+        combined = registry.find_plot_plugin("example.plot.combined")
+        assert combined is not None
+        assert combined.plugin_meta is plugin.plugin_meta
+        assert combined.build(1, foo=2) == ("build", (1,), {"foo": 2})
+        assert combined.render(3, bar=4) == ("render", (3,), {"bar": 4})
 
-            trusted_combined = registry.find_plot_plugin_trusted("example.plot.combined")
-            assert trusted_combined is not None
-            assert trusted_combined.build(5) == ("build", (5,), {})
+        trusted_combined = registry.find_plot_plugin_trusted("example.plot.combined")
+        assert trusted_combined is not None
+        assert trusted_combined.build(5) == ("build", (5,), {})
     finally:
-        registry.clear_plot_plugins()
+        clear_plot_plugins()
 
 
 def test_list_descriptors_and_trust_management(monkeypatch):
     registry.clear()
-    registry.clear_explanation_plugins()
-    registry.clear_interval_plugins()
+    clear_explanation_plugins()
+    clear_interval_plugins()
     monkeypatch.setattr(registry, "ensure_builtin_plugins", lambda: None)
 
     class AltExplanationPlugin:
@@ -455,20 +481,20 @@ def test_list_descriptors_and_trust_management(monkeypatch):
         assert [d.identifier for d in trusted_intervals] == ["core.interval.trusted"]
     finally:
         registry.clear()
-        registry.clear_explanation_plugins()
-        registry.clear_interval_plugins()
+        clear_explanation_plugins()
+        clear_interval_plugins()
 
 
 def test_load_entrypoint_plugins_error_branches(monkeypatch):
     registry.clear()
-    registry.clear_trust_warnings()
-    registry.clear_env_trust_cache()
+    clear_trust_warnings()
+    clear_env_trust_cache()
 
     class NoMetaPlugin:
         pass
 
     class InvalidPlugin:
-        plugin_meta = {"name": "invalid"}
+        plugin_meta = {"name": "invalid", "data_modalities": ("tabular",)}
 
     class UntrustedPlugin:
         plugin_meta = {
@@ -478,6 +504,7 @@ def test_load_entrypoint_plugins_error_branches(monkeypatch):
             "version": "0.0-test",
             "provider": "tests",
             "dependencies": [],
+            "data_modalities": ("tabular",),
             "trust": False,
         }
 
@@ -489,6 +516,7 @@ def test_load_entrypoint_plugins_error_branches(monkeypatch):
             "version": "0.0-test",
             "provider": "tests",
             "dependencies": [],
+            "data_modalities": ("tabular",),
             "trust": True,
         }
 
@@ -503,7 +531,7 @@ def test_load_entrypoint_plugins_error_branches(monkeypatch):
             self.name = name
             self.module = module or "tests.plugins.fake"
             self.attr = attr
-            self.group = registry.get_entrypoint_group()
+            self.group = get_entrypoint_group()
             self.loader_func = loader
 
         def load(self):
@@ -524,7 +552,7 @@ def test_load_entrypoint_plugins_error_branches(monkeypatch):
     entry_points = FakeEntryPoints([failing, no_meta, invalid, untrusted, trusted, attr_entry])
     monkeypatch.setattr(registry.importlib_metadata, "entry_points", lambda: entry_points)
     monkeypatch.setenv("CE_TRUST_PLUGIN", "trusted,attr")
-    registry.clear_env_trust_cache()
+    clear_env_trust_cache()
 
     try:
         with pytest.warns(UserWarning):
@@ -534,6 +562,6 @@ def test_load_entrypoint_plugins_error_branches(monkeypatch):
         assert all(plugin in registry.list_plugins(include_untrusted=False) for plugin in loaded)
     finally:
         registry.clear()
-        registry.clear_trust_warnings()
-        registry.clear_env_trust_cache()
+        clear_trust_warnings()
+        clear_env_trust_cache()
         sys.modules.pop(attr_module_name, None)

@@ -1,6 +1,12 @@
 # pylint: disable=unknown-option-value, too-many-arguments
 # pylint: disable=too-many-lines, too-many-public-methods, invalid-name, too-many-positional-arguments, line-too-long
-"""Containers for storing, exporting, and visualising calibrated explanations."""
+"""Containers for storing, exporting, and visualising calibrated explanations.
+
+This module implements :class:`CalibratedExplanations`, a container that
+holds per-instance explanation objects (factual, alternative, fast) and
+provides helpers for exporting, iterating and aggregating explanation
+collections.
+"""
 
 from __future__ import annotations
 
@@ -13,24 +19,43 @@ import warnings
 from collections.abc import Sequence as ABCSequence
 from copy import copy, deepcopy
 from dataclasses import dataclass
+from itertools import permutations
 from time import time
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union, cast
 
 import numpy as np
 
-from ..utils import EntropyDiscretizer, RegressorDiscretizer, prepare_for_saving
+from ..core.prediction_helpers import validate_and_prepare_input
+from ..utils import EntropyDiscretizer, RegressorDiscretizer, deprecate, prepare_for_saving
 from ..utils.exceptions import ValidationError
+from ..utils.helper import calculate_metrics
 from .adapters import legacy_to_domain
 from .explanation import AlternativeExplanation, FactualExplanation, FastExplanation
 from .models import Explanation as DomainExplanation
-from ..core.prediction_helpers import validate_and_prepare_input
-from ..utils.helper import calculate_metrics, prepare_for_saving
 
 _LOGGER = logging.getLogger(__name__)
 
-from ..plotting import  _plot_probabilistic_dict, get_multiclass_config, _plot_alternative_dict
-import matplotlib.colors as mcolors
-from itertools import permutations
+
+def _plot_alternative_dict(*args, **kwargs):
+    """Lazy wrapper to avoid importing plotting dependencies at module import time."""
+    from ..plotting import _plot_alternative_dict as _impl
+
+    return _impl(*args, **kwargs)
+
+
+def _plot_probabilistic_dict(*args, **kwargs):
+    """Lazy wrapper to avoid importing plotting dependencies at module import time."""
+    from ..plotting import _plot_probabilistic_dict as _impl
+
+    return _impl(*args, **kwargs)
+
+
+def get_multiclass_config():
+    """Lazy wrapper to avoid importing plotting dependencies at module import time."""
+    from ..plotting import get_multiclass_config as _impl
+
+    return _impl()
+
 
 @dataclass(frozen=True)
 class ExportedExplanationCollection:
@@ -48,6 +73,32 @@ class ExportedExplanationCollection:
             The state dictionary.
         """
         # Convert mappingproxy to dict for pickling
+        return dict(self.__dict__)
+
+
+@dataclass(frozen=True)
+class ExportedMultiClassExplanationCollection:
+    """Exported multiclass explanations grouped by instance and class index."""
+
+    metadata: Mapping[str, Any]
+    explanations_by_instance: Sequence[Mapping[int, DomainExplanation]]
+
+    @property
+    def explanations(self) -> Sequence[DomainExplanation]:
+        """Return flattened exported explanations for backward-compatible access."""
+        flattened: list[DomainExplanation] = []
+        for per_instance in self.explanations_by_instance:
+            flattened.extend(per_instance.values())
+        return tuple(flattened)
+
+    def __getstate__(self):
+        """Get state for pickling.
+
+        Returns
+        -------
+        dict
+            The state dictionary.
+        """
         return dict(self.__dict__)
 
 
@@ -156,6 +207,72 @@ class CalibratedExplanations:  # pylint: disable=too-many-instance-attributes
     def build_rules_payload(self) -> List[Dict[str, Any]]:
         """Delegate payload materialisation to each stored explanation."""
         return [exp.build_rules_payload() for exp in self.explanations]
+
+    def get_guarded_audit(self) -> Dict[str, Any]:
+        """Return guarded interval audit for the collection and each instance.
+
+        Raises
+        ------
+        ValidationError
+            If called on a non-guarded explanation collection.
+        """
+        if not self.explanations:
+            return {
+                "summary": {
+                    "n_instances": 0,
+                    "intervals_tested": 0,
+                    "intervals_conforming": 0,
+                    "intervals_removed_guard": 0,
+                    "intervals_emitted": 0,
+                    "instances_with_any_removed_guard": 0,
+                    "instances_all_intervals_removed_guard": 0,
+                    "instances_with_zero_emitted": 0,
+                },
+                "instances": [],
+            }
+
+        if not all(hasattr(exp, "get_guarded_audit") for exp in self.explanations):
+            raise ValidationError(
+                "get_guarded_audit is only available for guarded explanation collections. "
+                "Use explain_guarded_factual(...) or explore_guarded_alternatives(...).",
+                details={"collection_type": type(self).__name__},
+            )
+
+        instances = [exp.get_guarded_audit() for exp in self.explanations]
+        intervals_tested = int(sum(inst["summary"]["intervals_tested"] for inst in instances))
+        intervals_conforming = int(
+            sum(inst["summary"]["intervals_conforming"] for inst in instances)
+        )
+        intervals_removed_guard = int(
+            sum(inst["summary"]["intervals_removed_guard"] for inst in instances)
+        )
+        intervals_emitted = int(sum(inst["summary"]["intervals_emitted"] for inst in instances))
+
+        return {
+            "summary": {
+                "n_instances": int(len(instances)),
+                "intervals_tested": intervals_tested,
+                "intervals_conforming": intervals_conforming,
+                "intervals_removed_guard": intervals_removed_guard,
+                "intervals_emitted": intervals_emitted,
+                "instances_with_any_removed_guard": int(
+                    sum(1 for inst in instances if inst["summary"]["intervals_removed_guard"] > 0)
+                ),
+                "instances_all_intervals_removed_guard": int(
+                    sum(
+                        1
+                        for inst in instances
+                        if inst["summary"]["intervals_tested"] > 0
+                        and inst["summary"]["intervals_removed_guard"]
+                        == inst["summary"]["intervals_tested"]
+                    )
+                ),
+                "instances_with_zero_emitted": int(
+                    sum(1 for inst in instances if inst["summary"]["intervals_emitted"] == 0)
+                ),
+            },
+            "instances": instances,
+        }
 
     def copy(self, deep=False):
         """Return a copy of the collection.
@@ -580,11 +697,38 @@ class CalibratedExplanations:  # pylint: disable=too-many-instance-attributes
         explanations_blob = payload.get("explanations", []) or []
         domain: list[DomainExplanation] = []
         for item in explanations_blob:
-            domain.append(_explanation_from_json(item))
+            # Extract explicit multiclass annotations when present on the raw payload
+            cls_idx = None
+            cls_label = None
+            if isinstance(item, Mapping):
+                cls_idx = item.get("class_index")
+                cls_label = item.get("class_label")
+                # Also allow annotations under item['metadata'] when produced by other exporters
+                meta = item.get("metadata") if isinstance(item.get("metadata"), Mapping) else None
+                if meta is not None:
+                    if cls_idx is None:
+                        cls_idx = meta.get("class_index")
+                    if cls_label is None:
+                        cls_label = meta.get("class_label")
+
+            domain_exp = _explanation_from_json(item)
+
+            # Ensure metadata is mutable dict and propagate class annotations
+            m = dict(domain_exp.metadata) if isinstance(domain_exp.metadata, Mapping) else {}
+            if cls_idx is not None:
+                try:
+                    m.setdefault("class_index", int(cls_idx))
+                except (TypeError, ValueError, OverflowError):
+                    m.setdefault("class_index", cls_idx)
+            if cls_label is not None:
+                m.setdefault("class_label", cls_label)
+            # attach back
+            domain_exp.metadata = m or None
+            domain.append(domain_exp)
+
         metadata = payload.get("collection", {}) or {}
         return ExportedExplanationCollection(
-            metadata=cast(Mapping[str, Any], _jsonify(metadata)),
-            explanations=tuple(domain),
+            metadata=cast(Mapping[str, Any], _jsonify(metadata)), explanations=tuple(domain)
         )
 
     # ------------------------------------------------------------------
@@ -1072,56 +1216,46 @@ class CalibratedExplanations:  # pylint: disable=too-many-instance-attributes
             )
         return self
 
-    def get_explanation(self, index):
-        """Return the explanation corresponding to the index.
+    def filter_features(
+        self,
+        *,
+        exclude_features=None,
+        include_features=None,
+        copy: bool = True,
+    ) -> "CalibratedExplanations":
+        """Filter rules by feature inclusion or exclusion across all explanations.
 
         Parameters
         ----------
-        index : int
-            The index of the explanation to retrieve.
+        exclude_features : str, int, or sequence of str/int, optional
+            Feature names (str) or indices (int) to exclude. Rules containing any
+            of these features will be removed.
+        include_features : str, int, or sequence of str/int, optional
+            Feature names (str) or indices (int) to include. Only rules containing
+            these features will be kept.
+        copy : bool, default=True
+            If True, return a filtered copy without mutating the original.
 
         Returns
         -------
-        CalibratedExplanation
-            The explanation at the specified index.
-
-        Warnings
-        --------
-        Deprecated: This method is deprecated and may be removed in future versions. Use indexing instead.
+        CalibratedExplanations
+            Filtered explanations object.
         """
-        from ..utils import deprecate
-        from ..utils.exceptions import ValidationError
+        if copy:
+            new_obj = self.copy()
+            new_obj.explanations = [
+                explanation.filter_features(
+                    exclude_features=exclude_features, include_features=include_features, copy=True
+                )
+                for explanation in self.explanations
+            ]
+            return new_obj
 
-        deprecate(
-            "This method is deprecated and may be removed in future versions. Use indexing instead.",
-            key="CalibratedExplanations.get_explanation",
-            stacklevel=3,
-        )
-        if not isinstance(index, int):
-            raise ValidationError(
-                "index must be an integer",
-                details={
-                    "param": "index",
-                    "expected_type": "int",
-                    "actual_type": type(index).__name__,
-                },
+        for idx, explanation in enumerate(self.explanations):
+            self.explanations[idx] = explanation.filter_features(
+                exclude_features=exclude_features, include_features=include_features, copy=False
             )
-        if index < 0:
-            raise ValidationError(
-                "index must be greater than or equal to 0",
-                details={"param": "index", "value": index, "requirement": "non-negative"},
-            )
-        if index >= len(self.x_test):
-            raise ValidationError(
-                "index must be less than the number of test instances",
-                details={
-                    "param": "index",
-                    "value": index,
-                    "max_index": len(self.x_test) - 1,
-                    "n_instances": len(self.x_test),
-                },
-            )
-        return self.explanations[index]
+        return self
 
     def is_alternative(self):
         """Return True when the collection represents an alternative explanation workflow."""
@@ -1162,8 +1296,8 @@ class CalibratedExplanations:  # pylint: disable=too-many-instance-attributes
         uncertainty : bool, default=False
             Determines whether to include uncertainty information in the plots.
         style : str, default='regular'
-            The style of the plot. Supported styles are 'regular' and 'triangular'
-            (experimental).
+            The style of the plot. Supported styles are 'regular' and 'triangular'.
+            Use ``style='ensured'`` as an alias for ``style='triangular'``.
         rnk_metric : str, default=None
             The metric used to rank the features. Supported metrics are 'ensured',
             'feature_weight', and 'uncertainty'. If None, the default from the explanation
@@ -1188,6 +1322,22 @@ class CalibratedExplanations:  # pylint: disable=too-many-instance-attributes
             Refer to the docstring for plot in FastExplanation for details on default ranking
             ('feature_weight').
         """
+        if style == "ensured":
+            style = "triangular"
+
+        custom_plot_style = isinstance(style, str) and style not in {
+            "regular",
+            "triangular",
+            "ensured",
+            "narrative",
+        }
+        if index is None and custom_plot_style:
+            selected_instance_index = kwargs.get("instance_index")
+            if isinstance(selected_instance_index, int):
+                kwargs = dict(kwargs)
+                kwargs.pop("instance_index", None)
+                index = selected_instance_index
+
         if style == "narrative":
             from ..viz.narrative_plugin import NarrativePlotPlugin
 
@@ -1218,6 +1368,29 @@ class CalibratedExplanations:  # pylint: disable=too-many-instance-attributes
 
         if len(filename) > 0:
             path, filename, title, ext = prepare_for_saving(filename)
+            plugin_path = filename
+            plugin_save_ext = ext
+        else:
+            plugin_path = None
+            plugin_save_ext = None
+
+        if index is None and custom_plot_style:
+            from ..plotting import _render_collection_plot_plugin
+
+            plugin_result = _render_collection_plot_plugin(
+                self,
+                explicit_style=style_override
+                if isinstance(style_override, str) and style_override
+                else style,
+                show=show,
+                path=plugin_path,
+                save_ext=plugin_save_ext,
+                renderer_override=kwargs.get("renderer"),
+                intent_type="alternative" if self.is_alternative() else "factual",
+                options=kwargs,
+            )
+            if plugin_result is not None:
+                return plugin_result
 
         if index is not None:
             if len(filename) > 0:
@@ -1252,6 +1425,9 @@ class CalibratedExplanations:  # pylint: disable=too-many-instance-attributes
                     )
                 )
             if kwargs.get("return_plot_spec"):
+                return results[0] if len(results) == 1 else results
+            non_null_results = [result for result in results if result is not None]
+            if non_null_results:
                 return results[0] if len(results) == 1 else results
 
     def to_narrative(
@@ -1338,6 +1514,32 @@ class CalibratedExplanations:  # pylint: disable=too-many-instance-attributes
             **kwargs,
         )
 
+    def to_dataframe(self, *args, **kwargs):
+        """Return the narrative output as a pandas DataFrame.
+
+        Call :meth:`to_narrative` with ``output_format='dataframe'`` and return
+        the resulting DataFrame. Accepts the same arguments as
+        :meth:`to_narrative`.
+        """
+        kwargs.setdefault("output_format", "dataframe")
+        return self.to_narrative(*args, **kwargs)
+
+    @staticmethod
+    def _deprecate_lime_shap_surface(
+        symbol: str,
+        replacement: str,
+        *,
+        removal_version: str,
+    ) -> None:
+        """Emit Task-21 deprecation warning for collection LIME/SHAP export helpers."""
+        deprecate(
+            f"CalibratedExplanations.{symbol} is deprecated since v0.11.1; use "
+            f"{replacement} instead. This API is scheduled for removal by {removal_version} "
+            "under the pre-v1.0 zero-deprecation closure policy.",
+            key=f"CalibratedExplanations.{symbol}_lime_shap_deprecation",
+            stacklevel=4,
+        )
+
     # pylint: disable=protected-access
     def as_lime(self, num_features_to_show=None):
         """Transform the explanations into LIME explanation objects.
@@ -1347,7 +1549,14 @@ class CalibratedExplanations:  # pylint: disable=too-many-instance-attributes
         list of lime.Explanation
             List of LIME explanation objects with the same values as the `CalibratedExplanations`.
         """
-        _, lime_exp = self.calibrated_explainer.preload_lime()
+        self._deprecate_lime_shap_surface(
+            "as_lime",
+            "external_plugins.integrations.lime_pipeline.LimePipeline(...).explain(...)",
+            removal_version="v0.11.3",
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            _, lime_exp = self.calibrated_explainer.preload_lime()
         exp = []
         for explanation in self.explanations:  # range(len(self.x[:,0])):
             tmp = deepcopy(lime_exp)
@@ -1390,7 +1599,14 @@ class CalibratedExplanations:  # pylint: disable=too-many-instance-attributes
         shap.Explanation
             SHAP explanation object with the same values as the explanation.
         """
-        _, shap_exp = self.calibrated_explainer.preload_shap()
+        self._deprecate_lime_shap_surface(
+            "as_shap",
+            "external_plugins.integrations.shap_pipeline.ShapPipeline(...).explain(...)",
+            removal_version="v0.11.3",
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            _, shap_exp = self.calibrated_explainer.preload_shap()
         shap_exp.base_values = np.resize(shap_exp.base_values, len(self))
         shap_exp.values = np.resize(shap_exp.values, (len(self), len(self.x_test[0, :])))
         shap_exp.data = self.x_test
@@ -1446,6 +1662,12 @@ class AlternativeExplanations(CalibratedExplanations):
                 only_ensured=only_ensured, include_potential=include_potential, copy=False
             )
         return self
+
+    def super(self, only_ensured=False, include_potential=True, copy=True):
+        """Shorthand delegator for :meth:`.super_explanations`."""
+        return self.super_explanations(
+            only_ensured=only_ensured, include_potential=include_potential, copy=copy
+        )
 
     @classmethod
     def from_collection(cls, collection: "CalibratedExplanations"):
@@ -1522,6 +1744,12 @@ class AlternativeExplanations(CalibratedExplanations):
             )
         return self
 
+    def semi(self, only_ensured=False, include_potential=True, copy=True):
+        """Shorthand delegator for :meth:`.semi_explanations`."""
+        return self.semi_explanations(
+            only_ensured=only_ensured, include_potential=include_potential, copy=copy
+        )
+
     def counter_explanations(self, only_ensured=False, include_potential=True, copy=True):
         """
         Return a copy with only counter-explanations.
@@ -1561,11 +1789,17 @@ class AlternativeExplanations(CalibratedExplanations):
             )
         return self
 
+    def counter(self, only_ensured=False, include_potential=True, copy=True):
+        """Shorthand delegator for :meth:`.counter_explanations`."""
+        return self.counter_explanations(
+            only_ensured=only_ensured, include_potential=include_potential, copy=copy
+        )
+
     def ensured_explanations(self, include_potential=True, copy=True):
         """
         Return a copy with only ensured explanations.
 
-        Ensured explanations are individual rules that have a smaller confidence interval.
+        Ensured explanations are individual rules that have a narrower uncertainty interval.
 
         Parameters
         ----------
@@ -1589,6 +1823,69 @@ class AlternativeExplanations(CalibratedExplanations):
         for explanation in self.explanations:
             explanation.ensured_explanations(include_potential=include_potential, copy=False)
         return self
+
+    def ensured(self, include_potential=True, copy=True):
+        """Shorthand delegator for :meth:`.ensured_explanations`."""
+        return self.ensured_explanations(include_potential=include_potential, copy=copy)
+
+    def pareto_explanations(
+        self,
+        include_potential: bool = True,
+        copy: bool = True,
+        *,
+        pareto_cost: str = "uncertainty_width",
+    ):
+        """Return a copy with only output-envelope Pareto alternatives.
+
+        Parameters
+        ----------
+        include_potential : bool, default=True
+            Determines whether to include potential explanations before
+            extracting the Pareto frontier.
+        copy : bool, default=True
+            Determines whether to return a copy of the explanations or modify
+            them in place.
+        pareto_cost : str, default="uncertainty_width"
+            The Pareto cost dimension minimized along the output axis.
+
+        Returns
+        -------
+        AlternativeExplanations
+            A new ``AlternativeExplanations`` object containing Pareto-front
+            alternatives.
+        """
+        if copy:
+            new_obj = self.copy()
+            new_obj.explanations = [
+                explanation.pareto_explanations(
+                    include_potential=include_potential,
+                    copy=True,
+                    pareto_cost=pareto_cost,
+                )
+                for explanation in self.explanations
+            ]
+            return new_obj
+        for explanation in self.explanations:
+            explanation.pareto_explanations(
+                include_potential=include_potential,
+                copy=False,
+                pareto_cost=pareto_cost,
+            )
+        return self
+
+    def pareto(
+        self,
+        include_potential: bool = True,
+        copy: bool = True,
+        *,
+        pareto_cost: str = "uncertainty_width",
+    ):
+        """Shorthand delegator for :meth:`.pareto_explanations`."""
+        return self.pareto_explanations(
+            include_potential=include_potential,
+            copy=copy,
+            pareto_cost=pareto_cost,
+        )
 
 
 class FrozenCalibratedExplainer:
@@ -1865,50 +2162,52 @@ class FrozenCalibratedExplainer:
         else:
             raise AttributeError("Cannot modify frozen instance")
 
+
 class MultiClassCalibratedExplanations(CalibratedExplanations):
     """
     A class for storing and visualizing calibrated explanations for multi-class classification.
-    
+
     This class extends `CalibratedExplanations` to support multi-class explanations,
     allowing storage and retrieval of explanations per instance using a dictionary.
     """
 
-    def __init__(self, calibrated_explainer, X_test, bins, num_classes):
-        """
-        Initialize the multiClassCalibratedExplanations object.
-
-        Parameters
-        ----------
-        calibrated_explainer : CalibratedExplainer
-            The calibrated explainer object.
-        X_test : array-like
-            The test data.
-        y_threshold : float or tuple
-            The threshold for regression explanations.
-        bins : array-like
-            The bins for conditional explanations.
-        num_classes : int
-            The number of classes in the classification task.
-        """
-        X_test = validate_and_prepare_input(calibrated_explainer, X_test)
-        super().__init__(calibrated_explainer, X_test, None, bins)
+    def __init__(self, calibrated_explainer, x_test, bins, num_classes, explanations=None):
+        """Initialize multiclass explanation storage for one or more instances."""
+        x_test = validate_and_prepare_input(calibrated_explainer, x_test)
+        super().__init__(calibrated_explainer, x_test, None, bins)
         self.num_classes = num_classes
-        self.explanations = [{} for _ in range(len(X_test))]  # Dictionary for class explanations per instance
+        if explanations is None:
+            self.explanations = [{} for _ in range(len(x_test))]
+        else:
+            self.explanations = deepcopy(explanations)
 
-    def __init__(self, calibrated_explainer, X_test, bins, num_classes, explanations):
-        X_test = validate_and_prepare_input(calibrated_explainer, X_test)
-        super().__init__(calibrated_explainer, X_test, None, bins)
-        self.num_classes = num_classes
-        self.explanations =deepcopy(explanations)
+    def _first_explanation_for_instance(self, index):
+        """Return the first explanation stored for an instance regardless of class key."""
+        if index < 0 or index >= len(self.explanations):
+            return None
+        instance_explanations = self.explanations[index]
+        if not instance_explanations:
+            return None
+        return next(iter(instance_explanations.values()))
+
+    @property
+    def X_test(self):  # noqa: N802
+        """Backward-compatible alias for x_test."""
+        return self.x_test
 
     def __repr__(self):
         """Return the string representation of the MultiClassCalibratedExplanations object."""
-        explanations_str = "\n" + f"MultiClassCalibratedExplanations({len(self.explanations)} explanations):\n"
-        labels = self.explanations[0][0].get_class_labels() 
-        for i in range(len(self.explanations)) :
-            explanations_str +=f"explanation({i}):\n"
-            for ix, label in enumerate(labels):        
-                label_explanation = self.__getitem__((i,ix))
+        explanations_str = (
+            "\n" + f"MultiClassCalibratedExplanations({len(self.explanations)} explanations):\n"
+        )
+        first_explanation = self._first_explanation_for_instance(0)
+        if first_explanation is None:
+            return explanations_str
+        labels = first_explanation.get_class_labels()
+        for i in range(len(self.explanations)):
+            explanations_str += f"explanation({i}):\n"
+            for class_key, label in labels.items():
+                label_explanation = self.__getitem__((i, class_key))
                 explanations_str += f"explanation for label({label}):\n"
                 explanations_str += str(label_explanation)
         return explanations_str
@@ -1921,72 +2220,652 @@ class MultiClassCalibratedExplanations(CalibratedExplanations):
         If key is a tuple (index, class_idx), return the explanation for a specific class label as FactualExplanation.
         """
         if isinstance(key, int):
-            # Return MultiClassCalibratedExplanations ofonly one class explanation
-            return MultiClassCalibratedExplanations(self.calibrated_explainer, self.X_test, self.bins, self.num_classes, [self.explanations[key]])
+            # Mirror CalibratedExplanations semantics: integer indexing returns
+            # a single-instance view.
+            x_single = np.atleast_2d(self.x_test[key])
+            return MultiClassCalibratedExplanations(
+                self.calibrated_explainer,
+                x_single,
+                self.bins,
+                self.num_classes,
+                [self.explanations[key]],
+            )
+        if isinstance(key, slice):
+            return MultiClassCalibratedExplanations(
+                self.calibrated_explainer,
+                self.x_test[key],
+                self.bins,
+                self.num_classes,
+                self.explanations[key],
+            )
+        if isinstance(key, (list, np.ndarray)):
+            arr = np.asarray(key)
+            if arr.dtype == bool:
+                if len(arr) != len(self.explanations):
+                    raise IndexError(
+                        "Boolean index length must match number of explanations in collection."
+                    )
+                indices = np.where(arr)[0]
+            else:
+                indices = np.asarray(arr, dtype=int)
+            selected_explanations = [self.explanations[int(i)] for i in indices]
+            return MultiClassCalibratedExplanations(
+                self.calibrated_explainer,
+                self.x_test[indices],
+                self.bins,
+                self.num_classes,
+                selected_explanations,
+            )
         elif isinstance(key, tuple) and len(key) == 2:
             # Return Factual explanation of only one class label explanation
 
             index, class_idx = key
-            if isinstance(class_idx,int):
-                return self.explanations[index].get(class_idx, None)
-            elif isinstance(class_idx,str):
-                labels = self.explanations[index][0].get_class_labels() 
-                class_idx = list(labels.keys())[list(labels.values()).index(class_idx)]
-                return self.explanations[index].get(class_idx, None)
-        raise TypeError("Invalid argument type. Use an index (int) or (index, class) tuple.")
-    
-    def plot(self, index=None, class_idx=None, filter_top=10, show=True, filename="", uncertainty=False, style="regular", **kwargs):
+            # Accept both Python ints and numpy integer types
+            if isinstance(class_idx, (int, np.integer)):
+                return self.explanations[index].get(int(class_idx), None)
+            elif isinstance(class_idx, str):
+                first_explanation = self._first_explanation_for_instance(index)
+                if first_explanation is None:
+                    return None
+                labels = first_explanation.get_class_labels()
+                try:
+                    class_idx = list(labels.keys())[list(labels.values()).index(class_idx)]
+                except ValueError as exc:
+                    raise KeyError(f"Unknown class label '{class_idx}' for index {index}.") from exc
+                return self.explanations[index].get(int(class_idx), None)
+        raise ValidationError("Invalid argument type. Use an index (int) or (index, class) tuple.")
+
+    def get_explanation(self, index, class_idx=None):
+        """Return explanation(s) at ``index``, optionally narrowed to ``class_idx``."""
+        if class_idx is None:
+            return self[index]
+        return self[(index, class_idx)]
+
+    # ------------------------------------------------------------------
+    # Multiclass-specific overrides (dispatch into per-class dicts)
+    # ------------------------------------------------------------------
+    def __iter__(self):
+        """Iterate yielding single-instance views (align with base semantics)."""
+        for i in range(len(self.explanations)):
+            yield self[i]
+
+    @classmethod
+    def from_json(cls, payload: Mapping[str, Any]) -> ExportedMultiClassExplanationCollection:
+        """Materialise grouped multiclass explanations from exported JSON payload.
+
+        Raises
+        ------
+        ValidationError
+            If top-level or item-level schema versions are missing/unsupported,
+            or required multiclass keys cannot be restored.
+        """
+        from ..serialization import from_json as _explanation_from_json
+
+        expected_schema = "1.0.0"
+        schema_version = payload.get("schema_version")
+        if schema_version != expected_schema:
+            raise ValidationError(
+                "Unsupported multiclass payload schema version.",
+                details={"expected": expected_schema, "received": schema_version},
+            )
+
+        explanations_blob = payload.get("explanations", [])
+        if not isinstance(explanations_blob, list):
+            raise ValidationError(
+                "Multiclass payload explanations must be a list.",
+                details={"type": type(explanations_blob).__name__},
+            )
+
+        grouped: dict[int, dict[int, DomainExplanation]] = {}
+        for item in explanations_blob:
+            if not isinstance(item, Mapping):
+                raise ValidationError(
+                    "Each multiclass explanation item must be a mapping.",
+                    details={"type": type(item).__name__},
+                )
+            item_schema = item.get("schema_version")
+            if item_schema != expected_schema:
+                raise ValidationError(
+                    "Unsupported multiclass explanation item schema version.",
+                    details={"expected": expected_schema, "received": item_schema},
+                )
+
+            try:
+                instance_index = int(item.get("index"))
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValidationError(
+                    "Multiclass explanation item is missing a valid instance index.",
+                    details={"index": item.get("index")},
+                ) from exc
+
+            metadata_map = item.get("metadata")
+            metadata_dict = metadata_map if isinstance(metadata_map, Mapping) else {}
+            class_index_raw = item.get("class_index", metadata_dict.get("class_index"))
+            class_label = item.get("class_label", metadata_dict.get("class_label"))
+            if class_index_raw is None:
+                raise ValidationError(
+                    "Multiclass explanation item is missing class_index.",
+                    details={"index": instance_index},
+                )
+
+            try:
+                class_index = int(class_index_raw)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValidationError(
+                    "Multiclass explanation item has invalid class_index.",
+                    details={"index": instance_index, "class_index": class_index_raw},
+                ) from exc
+
+            domain_exp = _explanation_from_json(item)
+            metadata_out = (
+                dict(domain_exp.metadata) if isinstance(domain_exp.metadata, Mapping) else {}
+            )
+            metadata_out["class_index"] = class_index
+            if class_label is not None:
+                metadata_out["class_label"] = class_label
+            domain_exp.metadata = metadata_out or None
+
+            per_instance = grouped.setdefault(instance_index, {})
+            if class_index in per_instance:
+                raise ValidationError(
+                    "Duplicate class_index for multiclass explanation item.",
+                    details={"index": instance_index, "class_index": class_index},
+                )
+            per_instance[class_index] = domain_exp
+
+        ordered = tuple(grouped[idx] for idx in sorted(grouped))
+        metadata = payload.get("collection", {}) or {}
+        return ExportedMultiClassExplanationCollection(
+            metadata=cast(Mapping[str, Any], _jsonify(metadata)),
+            explanations_by_instance=ordered,
+        )
+
+    def add_conjunctions(self, n_top_features=5, max_rule_size=2, **kwargs):
+        """Apply add_conjunctions to every class-specific explanation."""
+        for class_dict in self.explanations:
+            for explanation in class_dict.values():
+                explanation.add_conjunctions(n_top_features, max_rule_size, **kwargs)
+        return self
+
+    def remove_conjunctions(self):
+        """Apply remove_conjunctions to every class-specific explanation."""
+        for class_dict in self.explanations:
+            for explanation in class_dict.values():
+                explanation.remove_conjunctions()
+        return self
+
+    def reset(self):
+        """Reset each class-specific explanation to original state."""
+        for class_dict in self.explanations:
+            for explanation in class_dict.values():
+                explanation.reset()
+        return self
+
+    def filter_rule_sizes(
+        self,
+        *,
+        rule_sizes: Optional[Any] = None,
+        size_range: Optional[Tuple[int, int]] = None,
+        copy: bool = True,
+    ):
+        """Filter rules by size across every class-specific explanation."""
+        if copy:
+            new_obj = self.copy()
+            new_obj.explanations = [
+                {
+                    k: exp.filter_rule_sizes(
+                        rule_sizes=rule_sizes, size_range=size_range, copy=True
+                    )
+                    for k, exp in class_dict.items()
+                }
+                for class_dict in self.explanations
+            ]
+            return new_obj
+
+        for idx, class_dict in enumerate(self.explanations):
+            for cls_key, explanation in class_dict.items():
+                self.explanations[idx][cls_key] = explanation.filter_rule_sizes(
+                    rule_sizes=rule_sizes, size_range=size_range, copy=False
+                )
+        return self
+
+    def filter_features(self, *, exclude_features=None, include_features=None, copy: bool = True):
+        """Filter features across every class-specific explanation."""
+        if copy:
+            new_obj = self.copy()
+            new_obj.explanations = [
+                {
+                    k: exp.filter_features(
+                        exclude_features=exclude_features,
+                        include_features=include_features,
+                        copy=True,
+                    )
+                    for k, exp in class_dict.items()
+                }
+                for class_dict in self.explanations
+            ]
+            return new_obj
+
+        for idx, class_dict in enumerate(self.explanations):
+            for cls_key, explanation in class_dict.items():
+                self.explanations[idx][cls_key] = explanation.filter_features(
+                    exclude_features=exclude_features, include_features=include_features, copy=False
+                )
+        return self
+
+    def get_rules(self):
+        """Return per-instance, per-class rule payloads.
+
+        Returns
+        -------
+        list of dict
+            Each item is a mapping {class_key: rules_payload} for that instance.
+        """
+        return [
+            {cls_key: exp.get_rules() for cls_key, exp in class_dict.items()}
+            for class_dict in self.explanations
+        ]
+
+    # Safe adapters / explicit not-implemented for adapters that assume flat lists
+    def as_lime(self):
+        """Raise for multiclass collections where a flat LIME export is undefined."""
+        self._deprecate_lime_shap_surface(
+            "as_lime",
+            "external_plugins.integrations.lime_pipeline.LimePipeline(...).explain(...)",
+            removal_version="v0.11.3",
+        )
+        raise NotImplementedError(
+            "as_lime() is not supported for multi-label collections. "
+            "Call get_explanation(i, cls).as_lime() for a specific class, or iterate over the collection "
+            "to build a per-class LIME mapping. If you need an aggregated LIME export, convert each per-class "
+            "explanation via get_explanation(i, cls).as_lime() and combine the results in your caller."
+        )
+
+    def as_shap(self):
+        """Raise for multiclass collections where a flat SHAP export is undefined."""
+        self._deprecate_lime_shap_surface(
+            "as_shap",
+            "external_plugins.integrations.shap_pipeline.ShapPipeline(...).explain(...)",
+            removal_version="v0.11.3",
+        )
+        raise NotImplementedError(
+            "as_shap() is not supported for multi-label collections. "
+            "Call get_explanation(i, cls).as_shap() for a specific class, or iterate and aggregate per-class SHAP outputs. "
+            "Aggregating SHAP across classes is application-specific; prefer per-class SHAP objects for downstream use."
+        )
+
+    def to_narrative(self, *args, **kwargs):
+        """
+        Generate narratives for a multiclass (multi-label) collection.
+
+        The method returns per-instance, per-class narratives. The behaviour depends
+        on ``output_format`` (same semantics as single-instance :meth:`to_narrative`):
+
+        - ``output_format='dict'``: returns ``List[Dict[class_key, narrative_dict]]``
+          where each item corresponds to an instance and maps class keys to the
+          narrative dict for that class.
+        - ``output_format='text'``: returns a single combined text containing the
+          narratives for every instance and class (human-readable).
+        - ``output_format='dataframe'``: returns a pandas DataFrame with columns
+          ``['instance', 'class', 'narrative']`` (requires pandas).
+
+        For other formats (e.g., 'html', 'markdown') the implementation will
+        attempt to coerce per-class outputs into the requested format where
+        reasonable.
+        """
+        # Normalize kwargs used by the single-explanation API
+        template_path = kwargs.pop("template_path", args[0] if len(args) > 0 else "exp.yaml")
+        expertise_level = kwargs.pop(
+            "expertise_level", kwargs.get("expertise_level", ("beginner", "advanced"))
+        )
+        output_format = kwargs.pop(
+            "output_format", kwargs.get("output_format", kwargs.get("output", "dataframe"))
+        )
+        conjunction_separator = kwargs.pop(
+            "conjunction_separator", kwargs.get("conjunction_separator", " AND ")
+        )
+        align_weights = kwargs.pop("align_weights", kwargs.get("align_weights", True))
+
+        # Helper to convert a per-class explanation to the desired intermediate dict
+        per_instance = []
+        for _i, class_dict in enumerate(self.explanations):
+            inst_map = {}
+            for cls_key, explanation in class_dict.items():
+                try:
+                    narr = explanation.to_narrative(
+                        template_path=template_path,
+                        expertise_level=expertise_level,
+                        output_format="dict",
+                        conjunction_separator=conjunction_separator,
+                        align_weights=align_weights,
+                        **kwargs,
+                    )
+                except (AttributeError, TypeError, ValueError, KeyError):
+                    # Fallback: try to obtain text output
+                    narr = {
+                        "text": explanation.to_narrative(
+                            template_path=template_path,
+                            expertise_level=expertise_level,
+                            output_format="text",
+                            conjunction_separator=conjunction_separator,
+                            align_weights=align_weights,
+                            **kwargs,
+                        )
+                    }
+                inst_map[int(cls_key)] = narr
+            per_instance.append(inst_map)
+
+        # Return according to requested format
+        if output_format == "dict":
+            return per_instance
+
+        if output_format == "text":
+            parts = []
+            for i, inst_map in enumerate(per_instance):
+                parts.append(f"Instance {i}:")
+                for cls_key, narr in inst_map.items():
+                    label = None
+                    first_exp = self._first_explanation_for_instance(i)
+                    if first_exp is not None:
+                        labels = first_exp.get_class_labels()
+                        label = labels.get(cls_key, None)
+                    hdr = f"  Class {cls_key}" + (f" ({label})" if label is not None else "")
+                    parts.append(hdr)
+                    if isinstance(narr, dict):
+                        text = narr.get("text") or narr.get("short") or str(narr)
+                    else:
+                        text = str(narr)
+                    parts.append(text)
+                    parts.append("")
+            return "\n".join(parts)
+
+        if output_format == "dataframe":
+            try:
+                import pandas as pd
+            except ImportError as exc:  # pragma: no cover - pandas import error path
+                raise ImportError("pandas is required for output_format='dataframe'") from exc
+
+            rows = []
+            for i, inst_map in enumerate(per_instance):
+                for cls_key, narr in inst_map.items():
+                    # narr is a dict produced by single-explanation output_format='dict'
+                    # Attempt to extract a compact textual narrative for a 'narrative' column
+                    if isinstance(narr, dict):
+                        text = narr.get("text") or narr.get("short") or str(narr)
+                    else:
+                        text = str(narr)
+                    rows.append({"instance": i, "class": int(cls_key), "narrative": text})
+
+            df = pd.DataFrame(rows)
+            return df
+
+        # Fall back to returning the dict structure for unknown formats
+        return per_instance
+
+    def to_json(self, *, include_version: bool = True) -> Mapping[str, Any]:
+        """Return a JSON-friendly payload describing this multiclass collection.
+
+        This mirrors :meth:`CalibratedExplanations.to_json` but emits one
+        exported explanation per (instance, class) pair. Each legacy payload
+        is augmented with ``class_index`` and, when available, ``class_label``.
+        """
+        from ..serialization import to_json as _explanation_to_json
+
+        instances = []
+        for idx, class_dict in enumerate(self.explanations):
+            for cls_key, exp in class_dict.items():
+                # Build legacy-shaped payload and annotate with class info
+                payload = dict(self._legacy_payload(exp))
+                payload["class_index"] = int(cls_key)
+                try:
+                    first = self._first_explanation_for_instance(idx)
+                    if first is not None:
+                        labels = first.get_class_labels()
+                        payload.setdefault("class_label", labels.get(int(cls_key)))
+                except (AttributeError, TypeError, ValueError, KeyError):
+                    _LOGGER.debug(
+                        "Failed to resolve class_label while exporting multiclass payload",
+                        exc_info=True,
+                    )
+
+                domain = legacy_to_domain(int(idx), payload)
+                provenance = getattr(exp, "provenance", None)
+                metadata = getattr(exp, "metadata", None)
+                if provenance is not None:
+                    domain.provenance = cast(Optional[Mapping[str, Any]], _jsonify(provenance))
+                if metadata is not None:
+                    domain.metadata = cast(Optional[Mapping[str, Any]], _jsonify(metadata))
+                instances.append(_explanation_to_json(domain, include_version=include_version))
+
+        payload: dict[str, Any] = {
+            "collection": self._collection_metadata(),
+            "explanations": instances,
+        }
+        if include_version:
+            payload.setdefault("schema_version", "1.0.0")
+
+        return payload
+
+    def to_json_stream(self, *, chunk_size: int = 256, format: str = "jsonl"):
+        """Stream the multiclass collection as JSON.
+
+        Yields the same fragments as :meth:`CalibratedExplanations.to_json_stream`
+        but emits one item per (instance, class) pair.
+        """
+        from ..serialization import to_json as _explanation_to_json
+
+        if format not in {"jsonl", "chunked"}:
+            raise ValidationError("Unsupported stream format", details={"format": format})
+
+        start = time()
+        tracemalloc.start()
+
+        metadata = dict(self._collection_metadata())
+        meta_fragment = {"collection": metadata, "schema_version": "1.0.0"}
+        yield json.dumps(meta_fragment, default=_jsonify)
+
+        chunk: List[str] = []
+        n = 0
+        for idx, class_dict in enumerate(self.explanations):
+            for cls_key, exp in class_dict.items():
+                payload = dict(self._legacy_payload(exp))
+                payload["class_index"] = int(cls_key)
+                try:
+                    first = self._first_explanation_for_instance(idx)
+                    if first is not None:
+                        labels = first.get_class_labels()
+                        payload.setdefault("class_label", labels.get(int(cls_key)))
+                except (AttributeError, TypeError, ValueError, KeyError):
+                    _LOGGER.debug(
+                        "Failed to resolve class_label while streaming multiclass payload",
+                        exc_info=True,
+                    )
+
+                domain = legacy_to_domain(int(idx), payload)
+                provenance = getattr(exp, "provenance", None)
+                metadata_exp = getattr(exp, "metadata", None)
+                if provenance is not None:
+                    domain.provenance = cast(Optional[Mapping[str, Any]], _jsonify(provenance))
+                if metadata_exp is not None:
+                    domain.metadata = cast(Optional[Mapping[str, Any]], _jsonify(metadata_exp))
+                item = _explanation_to_json(domain, include_version=True)
+                line = json.dumps(item, default=_jsonify)
+                n += 1
+                if format == "jsonl":
+                    yield line
+                else:  # chunked
+                    chunk.append(line)
+                    if len(chunk) >= chunk_size:
+                        yield "[" + ",".join(chunk) + "]"
+                        chunk = []
+
+        if format == "chunked" and chunk:
+            yield "[" + ",".join(chunk) + "]"
+
+        peak = tracemalloc.get_traced_memory()[1]
+        tracemalloc.stop()
+        elapsed = time() - start
+
+        telemetry = {
+            "export_rows": n,
+            "chunk_size": chunk_size,
+            "mode": getattr(self.calibrated_explainer, "mode", None),
+            "peak_memory_mb": round(float(peak) / (1024 * 1024), 3),
+            "elapsed_seconds": round(float(elapsed), 3),
+            "schema_version": "1.0.0",
+            "build_id": None,
+            "feature_flags": None,
+        }
+
+        try:
+            metadata.setdefault("export_telemetry", {})
+            metadata["export_telemetry"].update(telemetry)
+            underlying = getattr(self.calibrated_explainer, "_explainer", None)
+            if underlying is not None:
+                try:
+                    last = getattr(underlying, "_last_telemetry", None) or {}
+                    last.update({"export": telemetry})
+                    underlying._last_telemetry = last
+                except Exception:  # adr002_allow
+                    _LOGGER.info(
+                        "failed to attach export telemetry to underlying explainer",
+                        exc_info=True,
+                    )
+        except Exception:  # adr002_allow
+            _LOGGER.info("failed to attach export telemetry to collection", exc_info=True)
+
+        yield json.dumps({"export_telemetry": telemetry}, default=_jsonify)
+
+    # Properties that aggregate per-class values into per-instance dicts
+    @property
+    def predictions(self):
+        """Return per-instance per-class scalar predictions as a list of dicts."""
+        return [
+            {int(cls_key): getattr(exp, "predict", None) for cls_key, exp in class_dict.items()}
+            for class_dict in self.explanations
+        ]
+
+    @property
+    def prediction_interval(self):
+        """Return per-instance per-class prediction intervals as a list of dicts."""
+        return [
+            {
+                int(cls_key): getattr(exp, "prediction_interval", (None, None))
+                for cls_key, exp in class_dict.items()
+            }
+            for class_dict in self.explanations
+        ]
+
+    @property
+    def probabilities(self):
+        """Return per-instance per-class probability vectors as a list of dicts.
+
+        Each dict maps class_key -> the stored `prediction_probabilities` (if present) or
+        None when unavailable.
+        """
+        return [
+            {
+                int(cls_key): getattr(exp, "prediction_probabilities", None)
+                for cls_key, exp in class_dict.items()
+            }
+            for class_dict in self.explanations
+        ]
+
+    def plot(
+        self,
+        index=None,
+        class_idx=None,
+        filter_top=10,
+        show=True,
+        filename="",
+        uncertainty=False,
+        style="regular",
+        **kwargs,
+    ):
+        """Plot multiclass explanations as factual or alternative views."""
         if len(self.explanations) > 0:
-            
-            if isinstance(self.explanations[0][0],FactualExplanation):
-                self.plot_factual(index=index, class_idx=class_idx, filter_top=filter_top, show=show, filename=filename, uncertainty=uncertainty, style=style, **kwargs)
-            elif isinstance(self.explanations[0][0],AlternativeExplanation):
-                self.plot_alternative(index=index, class_idx=class_idx, filter_top=filter_top, show=show, filename=filename, uncertainty=uncertainty, style=style, **kwargs)
+            first_explanation = self._first_explanation_for_instance(0)
+            if isinstance(first_explanation, FactualExplanation):
+                self.plot_factual(
+                    index=index,
+                    class_idx=class_idx,
+                    filter_top=filter_top,
+                    show=show,
+                    filename=filename,
+                    uncertainty=uncertainty,
+                    style=style,
+                    **kwargs,
+                )
+            elif isinstance(first_explanation, AlternativeExplanation):
+                self.plot_alternative(
+                    index=index,
+                    class_idx=class_idx,
+                    filter_top=filter_top,
+                    show=show,
+                    filename=filename,
+                    uncertainty=uncertainty,
+                    style=style,
+                    **kwargs,
+                )
 
-        else: warnings.warn(f"No explanations found")
+        else:
+            warnings.warn("No explanations found", stacklevel=2)
 
-    def plot_alternative(self, index=None, class_idx=None, num_to_show=10, show=True, filename="", uncertainty=False, style="regular", **kwargs):
+    def plot_alternative(
+        self,
+        index=None,
+        class_idx=None,
+        filter_top=10,
+        show=True,
+        filename="",
+        uncertainty=False,
+        style="regular",
+        **kwargs,
+    ):
         """
         Plot explanations for a given instance and class.
 
         If no class is specified, plots explanations for all classes at that index.
         """
-        style_override = kwargs.get('style_override', get_multiclass_config())
+        style_override = kwargs.get("style_override", get_multiclass_config())
 
         if index is not None:
             if class_idx is not None:
-                explanation = self.get_explanation(index, class_idx)
+                explanation = self[index, class_idx]
                 if explanation:
                     explanation.plot(
                         filter_top=filter_top,
                         show=show,
                         filename=filename,
                         uncertainty=uncertainty,
-                        style=style
+                        style=style,
                     )
                 else:
-                    warnings.warn(f"No explanation found for instance {index}, class {class_idx}")
+                    warnings.warn(
+                        f"No explanation found for instance {index}, class {class_idx}",
+                        stacklevel=2,
+                    )
             else:
-                
                 self.__getitem__(index).plot(
                     filter_top=filter_top,
                     show=show,
                     filename=filename,
                     uncertainty=uncertainty,
-                    style=style
-                    
+                    style=style,
                 )
         else:
-            
-            rgb = np.array(list(permutations(range(0,256,11),3)))/255.0
-            colors = [rgb.tolist()[i*23] for i in range(25)] 
+            import matplotlib.colors as mcolors
+
+            rgb = np.array(list(permutations(range(0, 256, 11), 3))) / 255.0
+            colors = [rgb.tolist()[i * 23] for i in range(25)]
             colors = list(mcolors.BASE_COLORS.values())
             for i, class_explanations in enumerate(self.explanations):
                 # Ensure style_override gets passed through
                 class_explanations_list = list(class_explanations.values())
-                filename = kwargs.get("filename", "")
-                show = kwargs.get("show", filename == "")
-                uncertainty = kwargs.get("uncertainty", False)
+                # Respect the explicit arguments passed to plot_alternative()
+                # (do not override via kwargs in this multi-label/all-classes branch).
+                iter_filename = filename
+                iter_show = show
 
                 rnk_metric = kwargs.get("rnk_metric", "ensured")
                 if rnk_metric is None:
@@ -1996,11 +2875,23 @@ class MultiClassCalibratedExplanations(CalibratedExplanations):
                     rnk_weight = 1.0
                     rnk_metric = "ensured"
 
-                alternatives = [ex._get_rules() for ex in list(class_explanations.values()) ] # get_explanation(index) 
-                alternatives = self.sort_factuals_by_rule(alternatives)
+                alternatives = []
+                for ex in list(class_explanations.values()):
+                    get_rules = getattr(ex, "get_rules", None)
+                    if callable(get_rules):
+                        alternatives.append(get_rules())
+                    else:
+                        alternatives.append(ex._get_rules())
 
-                for ex in list(class_explanations.values()): ex._check_preconditions() 
-                predicts = [ex.prediction for ex in class_explanations_list ]  
+                    # Ensure each explanation has a sensible `index` set before
+                    # precondition checks or plotting. Some explanation objects
+                    # may be frozen; use best-effort assignment.
+                    for ex in class_explanations_list:
+                        with contextlib.suppress(Exception):
+                            ex.index = i
+                        with contextlib.suppress(Exception):
+                            ex._check_preconditions()
+                    predicts = [getattr(ex, "prediction", None) for ex in class_explanations_list]
 
                 filter_top = [len(alternative["rule"]) for alternative in alternatives]
                 """if filter_top is None:
@@ -2011,50 +2902,91 @@ class MultiClassCalibratedExplanations(CalibratedExplanations):
 
                 if len(filter_top) <= 0:
                     warnings.warn(
-                        f"The explanation has no rules to plot. The index of the instance is {self.index}" 
+                        f"The explanation has no rules to plot. The index of the instance is {i}",
+                        stacklevel=2,
                     )
                     return
 
-                if len(filename) > 0:
-                    path, filename, title, ext = prepare_for_saving(filename)
+                if len(iter_filename) > 0:
+                    path, iter_filename, title, ext = prepare_for_saving(iter_filename)
                     path = f"plots/{path}"
                     save_ext = [ext]
                 else:
                     path = ""
                     title = ""
                     save_ext = []
-                feature_predicts = [{
-                    "predict": alternative["predict"],
-                    "low": alternative["predict_low"],
-                    "high": alternative["predict_high"],
-                    "classes": alternative["classes"]
-                } for alternative in alternatives]
+                feature_predicts = [
+                    {
+                        "predict": alternative["predict"],
+                        "low": alternative["predict_low"],
+                        "high": alternative["predict_high"],
+                        "classes": alternative["classes"],
+                    }
+                    for alternative in alternatives
+                ]
 
-                widths = [np.reshape(
-                np.array(alternative["weight_high"]) - np.array(alternative["weight_low"]),
-                (len(alternative["weight"]))) for alternative in alternatives]
+                widths = [
+                    np.reshape(
+                        np.array(alternative["weight_high"]) - np.array(alternative["weight_low"]),
+                        (len(alternative["weight"])),
+                    )
+                    for alternative in alternatives
+                ]
 
-                features_weights = [np.reshape(alternative["weight"], (len(alternative["weight"]))) for alternative in alternatives]
+                features_weights = [
+                    np.reshape(alternative["weight"], (len(alternative["weight"])))
+                    for alternative in alternatives
+                ]
+
+                def _rank_features_for_multiclass(explanation, *args, **rank_kwargs):
+                    rank_fn = getattr(explanation, "rank_features", None)
+                    if callable(rank_fn):
+                        return rank_fn(*args, **rank_kwargs)
+                    return explanation._rank_features(*args, **rank_kwargs)
+
                 if rnk_metric == "feature_weight":
-                    features_list_to_plot = [ex._rank_features( 
-                        feature_weights, width=width, num_to_show=num_to_show
-                    ) for ex, feature_weights, width, num_to_show in zip(list(class_explanations.values()), features_weights, widths, filter_top)]
+                    features_list_to_plot = [
+                        _rank_features_for_multiclass(
+                            ex, feature_weights, width=width, num_to_show=num_to_show
+                        )
+                        for ex, feature_weights, width, num_to_show in zip(
+                            list(class_explanations.values()),
+                            features_weights,
+                            widths,
+                            filter_top,
+                            strict=False,
+                        )
+                    ]
                 else:
-                    predictions = [alternative["predict"] if predict["predict"] > 0.5 else [1 - p for p in alternative["predict"]] \
-                                   for alternative, predict in zip(alternatives, predicts)]
-                    rankings = [calculate_metrics(
-                    uncertainty=[
-                    alternative["predict_high"][i] - alternative["predict_low"][i]
-                    for i in range(len(alternative["rule"]))
-                    ],
-                    prediction=prediction,
-                    w=rnk_weight,
-                    metric=rnk_metric,
-                    )  for alternative, prediction in zip(alternatives, predictions)]
-                    features_list_to_plot = [ex._rank_features(width=ranking, num_to_show=num_to_show) for ex, ranking, num_to_show in zip(list(class_explanations.values()), rankings, filter_top)]  ####################
+                    predictions = [
+                        alternative["predict"]
+                        if predict["predict"] > 0.5
+                        else [1 - p for p in alternative["predict"]]
+                        for alternative, predict in zip(alternatives, predicts, strict=False)
+                    ]
+                    rankings = [
+                        calculate_metrics(
+                            uncertainty=[
+                                alternative["predict_high"][i] - alternative["predict_low"][i]
+                                for i in range(len(alternative["rule"]))
+                            ],
+                            prediction=prediction,
+                            w=rnk_weight,
+                            metric=rnk_metric,
+                        )
+                        for alternative, prediction in zip(alternatives, predictions, strict=False)
+                    ]
+                    features_list_to_plot = [
+                        _rank_features_for_multiclass(ex, width=ranking, num_to_show=num_to_show)
+                        for ex, ranking, num_to_show in zip(
+                            list(class_explanations.values()), rankings, filter_top, strict=False
+                        )
+                    ]  ####################
 
                 if "style" in kwargs and kwargs["style"] == "triangular":
-                    raise TypeError("triangular style does not support multi labels explanation, please set multi_explanation to None and try again!.")
+                    raise ValidationError(
+                        "triangular style does not support multi labels explanation, please set multi_explanation to None and try again!."
+                    )
                     """probas = [predict["predict"] for predict in predicts]
                     uncertainties = [np.abs(predict["high"] - predict["low"]) for predict in predicts]
                     rule_probas = [alternative["predict"] for alternative in alternatives]
@@ -2081,8 +3013,7 @@ class MultiClassCalibratedExplanations(CalibratedExplanations):
                         style_override=style_override,
                     )"""
                     return
-       
-                
+
                 alternatives_values = [alternative["value"] for alternative in alternatives]
 
                 column_names_list = [alternative["rule"] for alternative in alternatives]
@@ -2093,18 +3024,18 @@ class MultiClassCalibratedExplanations(CalibratedExplanations):
                     feature_predicts,
                     features_list_to_plot,
                     num_to_show_list=filter_top,
-                    colors= colors,
+                    colors=colors,
                     column_names_list=column_names_list,
                     title=title,
                     path=path,
-                    show=show,
+                    show=iter_show,
                     save_ext=save_ext,
                     style_override=style_override,
+                    idx=i,
                 )
 
-
-
-    def merge_rules(self,factuals):
+    def merge_rules(self, factuals):  # pragma: no cover  # dead code: zero callers
+        """Merge rule dictionaries from multiple class-specific factual explanations."""
         merged_factuals = {
             "base_predict": [],
             "base_predict_low": [],
@@ -2120,14 +3051,16 @@ class MultiClassCalibratedExplanations(CalibratedExplanations):
             "feature": [],
             "feature_value": [],
             "is_conjunctive": [],
-            "classes":[],
+            "classes": [],
         }
 
-        for i, factual in enumerate(factuals):  # pylint: disable=invalid-name
+        for _i, factual in enumerate(factuals):  # pylint: disable=invalid-name
             base_predicts = [factual["base_predict"][0] for _ in range(len(factual["rule"]))]
             base_predict_low = [factual["base_predict_low"][0] for _ in range(len(factual["rule"]))]
-            base_predict_high = [factual["base_predict_high"][0] for _ in range(len(factual["rule"]))]
-            classes= [factual["classes"] for _ in range(len(factual["rule"]))]
+            base_predict_high = [
+                factual["base_predict_high"][0] for _ in range(len(factual["rule"]))
+            ]
+            classes = [factual["classes"] for _ in range(len(factual["rule"]))]
 
             merged_factuals["base_predict"].extend(base_predicts)
             merged_factuals["base_predict_low"].extend(base_predict_low)
@@ -2148,132 +3081,86 @@ class MultiClassCalibratedExplanations(CalibratedExplanations):
 
         return merged_factuals
 
-    def plot_factual(self, index=None, class_idx=None, filter_top=10, show=True, filename="", uncertainty=False, style="regular", **kwargs):
+    def plot_factual(
+        self,
+        index=None,
+        class_idx=None,
+        filter_top=10,
+        show=True,
+        filename="",
+        uncertainty=False,
+        style="regular",
+        **kwargs,
+    ):
         """
         Plot explanations for a given instance and class.
 
         If no class is specified, plots explanations for all classes at that index.
         """
-
-        style_override = kwargs.get('style_override', get_multiclass_config())
+        style_override = kwargs.get("style_override", get_multiclass_config())
 
         if index is not None:
             if class_idx is not None:
-                explanation = self.get_explanation(index, class_idx)
+                explanation = self[index, class_idx]
                 if explanation:
                     explanation.plot(
                         filter_top=filter_top,
                         show=show,
                         filename=filename,
                         uncertainty=uncertainty,
-                        style=style
+                        style=style,
                     )
                 else:
-                    warnings.warn(f"No explanation found for instance {index}, class {class_idx}")
+                    warnings.warn(
+                        f"No explanation found for instance {index}, class {class_idx}",
+                        stacklevel=2,
+                    )
             else:
-                
                 self.__getitem__(index).plot(
                     filter_top=filter_top,
                     show=show,
                     filename=filename,
                     uncertainty=uncertainty,
-                    style=style
-                    
+                    style=style,
                 )
         else:
-            rgb = np.array(list(permutations(range(0,256,11),3)))/255.0
-            colors = [rgb.tolist()[i*23] for i in range(25)] 
-            colors = list(mcolors.BASE_COLORS.values())
             for i, class_explanations in enumerate(self.explanations):
-                if len(filename) > 0:
-                    path, _, title, ext = prepare_for_saving(str(i)+ "_"+filename)
-                    path = f"plots/{path}"
-                    save_ext = [ext]
-                else:
-                    path = ""
-                    title = ""
-                    save_ext = []
-                
                 # Ensure style_override gets passed through
-                class_explanations_list = list(class_explanations.values())
-                #filename = kwargs.get("filename", "")
-                #show = kwargs.get("show", filename == "")
-                #uncertainty = kwargs.get("uncertainty", False)
-                rnk_metric = kwargs.get("rnk_metric", "feature_weight")
-                if rnk_metric is None:
-                    rnk_metric = "feature_weight"
-                rnk_weight = kwargs.get("rnk_weight", 0.5)
-                if rnk_metric == "uncertainty":
-                    rnk_weight = 1.0
-                    rnk_metric = "ensured"
+                # Delegate non-render payload construction to helper for testability
+                payload = self._build_factual_plot_payload(
+                    i=i,
+                    class_explanations=class_explanations,
+                    filename=filename,
+                    show=show,
+                    uncertainty=uncertainty,
+                    style_override=style_override,
+                    kwargs=kwargs,
+                )
 
-                factuals = [ex.get_rules() for ex in list(class_explanations.values()) ] # get_explanation(index) 
-                factuals = self.sort_factuals_by_rule(factuals)
-                
-                for ex in list(class_explanations.values()): ex._check_preconditions() 
-                predicts = [ex.prediction for ex in class_explanations_list ]  
-                filter_top = [len(factual["weight"]) for factual in list(factuals.values())]
-                """if filter_top is None:
-                    filter_top = num_features_to_show_list
-                else:
-                    filter_top = [filter_top for factual in factuals]
-                filter_top = [np.min([num_features_to_show, filter_]) for num_features_to_show, filter_ in zip(num_features_to_show_list,filter_top)]"""
-                if len(filter_top) <= 0:
-                    warnings.warn(
-                        f"The explanation has no rules to plot. The index of the instance is {self.index}" 
-                    )
-                    return
+                if payload is None:
+                    # No rules to plot for this instance
+                    continue
 
-                if uncertainty:
-                    feature_weights_list = [{
-                        "predict": factual["weight"],
-                        "low": factual["weight_low"],
-                        "high": factual["weight_high"],
-                        "classes": factual["classes"]
-                    } for factual in list(factuals.values())]
-                else:
-                    feature_weights_list = [{"predict":factual["weight"], "classes": factual["classes"]} for factual in list(factuals.values())]
-                widths = [np.reshape(
-                    np.array(factual["weight_high"]) - np.array(factual["weight_low"]),
-                    (len(factual["weight"])),
-                ) for factual in list(factuals.values())]
+                _plot_probabilistic_dict(
+                    payload["class_explanations_list"],
+                    payload["factual_values"],
+                    payload["predicts"],
+                    payload["feature_weights_list"],
+                    payload["features_list_to_plot"],
+                    payload["filter_top"],
+                    payload["colors"],
+                    payload["column_names_list"],
+                    title=payload["title"],
+                    path=payload["path"],
+                    interval=payload["interval"],
+                    show=payload["show"],
+                    idx=payload["idx"],
+                    save_ext=payload["save_ext"],
+                    style_override=payload["style_override"],
+                )
 
-                if rnk_metric == "feature_weight":
-                    features_list_to_plot = [class_explanations[0].rank_features( 
-                        factual["weight"], width=width, num_to_show=num_to_show
-                    ) for factual, width, num_to_show in zip(list(factuals.values()), widths, filter_top)]
-                else:
-                    rankings = [calculate_metrics(
-                        uncertainty=[
-                            factual["predict_high"][i] - factual["predict_low"][i]
-                            for i in range(len(factual["weight"]))
-                        ],
-                        prediction=factual["predict"],
-                        w=rnk_weight,
-                        metric=rnk_metric,
-                    )  for factual in list(factuals.values())]
-                    features_list_to_plot = [class_explanations[0]._rank_features(width=ranking, num_to_show=num_to_show) for  ranking, num_to_show in zip( rankings, filter_top)]  ####################
-
-                column_names_list = [factual for factual in factuals]
-                factual_values = [factual["value"] for factual in list(factuals.values())]
-
-                _plot_probabilistic_dict(list(class_explanations.values()),
-                factual_values,
-                predicts,
-                feature_weights_list,
-                features_list_to_plot,
-                filter_top,
-                colors,
-                column_names_list,
-                title=title,
-                path=path,
-                interval=uncertainty,
-                show=show,
-                idx=None,
-                save_ext=save_ext,
-                style_override=style_override)
-
-    def sort_factuals_by_rule(self, factuals):
+    def sort_factuals_by_rule(self, factuals):  # pragma: no cover  # ADR-023: multiclass viz
+        """Group factual explanation entries by rule string across classes."""
         sorted_factuals = {}
         factual_rule = {
             "base_predict": [],
@@ -2290,17 +3177,16 @@ class MultiClassCalibratedExplanations(CalibratedExplanations):
             "feature": [],
             "feature_value": [],
             "is_conjunctive": [],
-            "classes":[],
+            "classes": [],
         }
-        for i, factual in enumerate(factuals):  # pylint: disable=invalid-name
-            new_factual_rule  = deepcopy(factual_rule)
-            base_predict = factual["base_predict"][0] 
-            base_predict_low = factual["base_predict_low"][0] 
-            base_predict_high = factual["base_predict_high"][0] 
-            cls= factual["classes"]
+        for _i, factual in enumerate(factuals):  # pylint: disable=invalid-name
+            base_predict = factual["base_predict"][0]
+            base_predict_low = factual["base_predict_low"][0]
+            base_predict_high = factual["base_predict_high"][0]
+            cls = factual["classes"]
             for j, rule in enumerate(factual["rule"]):
-                if not (rule in sorted_factuals):
-                    sorted_factuals[rule] =  deepcopy(factual_rule)
+                if rule not in sorted_factuals:
+                    sorted_factuals[rule] = deepcopy(factual_rule)
 
                 sorted_factuals[rule]["base_predict"].append(base_predict)
                 sorted_factuals[rule]["base_predict_low"].append(base_predict_low)
@@ -2319,3 +3205,137 @@ class MultiClassCalibratedExplanations(CalibratedExplanations):
                 sorted_factuals[rule]["feature_value"].append(factual["feature_value"][j])
                 sorted_factuals[rule]["is_conjunctive"].append(factual["is_conjunctive"][j])
         return sorted_factuals
+
+    def _build_factual_plot_payload(
+        self,
+        *,
+        i: int,
+        class_explanations: Mapping[Any, Any],
+        filename: str,
+        show: bool,
+        uncertainty: bool,
+        style_override: Any,
+        kwargs: Mapping[str, Any],
+    ) -> dict | None:
+        """Construct the non-render payload for plotting factual multiclass explanations.
+
+        Returns a dict containing the exact arguments needed by `_plot_probabilistic_dict`.
+        Returns ``None`` when there are no rules to plot for the given instance.
+        """
+        # Prepare colors similar to previous inline logic
+        import matplotlib.colors as mcolors
+
+        rgb = np.array(list(permutations(range(0, 256, 11), 3))) / 255.0
+        colors = [rgb.tolist()[i * 23] for i in range(25)]
+        colors = list(mcolors.BASE_COLORS.values())
+
+        class_explanations_list = list(class_explanations.values())
+
+        rnk_metric = kwargs.get("rnk_metric", "feature_weight")
+        if rnk_metric is None:
+            rnk_metric = "feature_weight"
+        rnk_weight = kwargs.get("rnk_weight", 0.5)
+        if rnk_metric == "uncertainty":
+            rnk_weight = 1.0
+            rnk_metric = "ensured"
+
+        factuals = [ex.get_rules() for ex in class_explanations_list]
+        factuals = self.sort_factuals_by_rule(factuals)
+
+        # Ensure each explanation has a sensible `index` set before checks
+        for ex in class_explanations_list:
+            with contextlib.suppress(Exception):
+                ex.index = i
+            with contextlib.suppress(Exception):
+                ex._check_preconditions()
+
+        predicts = [getattr(ex, "prediction", None) for ex in class_explanations_list]
+
+        filter_top = [len(factual["weight"]) for factual in list(factuals.values())]
+        if len(filter_top) <= 0:
+            return None
+
+        if uncertainty:
+            feature_weights_list = [
+                {
+                    "predict": factual["weight"],
+                    "low": factual["weight_low"],
+                    "high": factual["weight_high"],
+                    "classes": factual["classes"],
+                }
+                for factual in list(factuals.values())
+            ]
+        else:
+            feature_weights_list = [
+                {"predict": factual["weight"], "classes": factual["classes"]}
+                for factual in list(factuals.values())
+            ]
+
+        widths = [
+            np.reshape(
+                np.array(factual["weight_high"]) - np.array(factual["weight_low"]),
+                (len(factual["weight"])),
+            )
+            for factual in list(factuals.values())
+        ]
+
+        first_explanation = next(iter(class_explanations.values()))
+        rank_features = getattr(first_explanation, "rank_features", None)
+        if not callable(rank_features):
+            rank_features = first_explanation._rank_features
+
+        if rnk_metric == "feature_weight":
+            features_list_to_plot = [
+                rank_features(factual["weight"], width=width, num_to_show=num_to_show)
+                for factual, width, num_to_show in zip(
+                    list(factuals.values()), widths, filter_top, strict=False
+                )
+            ]
+        else:
+            rankings = [
+                calculate_metrics(
+                    uncertainty=[
+                        factual["predict_high"][j] - factual["predict_low"][j]
+                        for j in range(len(factual["weight"]))
+                    ],
+                    prediction=factual["predict"],
+                    w=rnk_weight,
+                    metric=rnk_metric,
+                )
+                for factual in list(factuals.values())
+            ]
+            features_list_to_plot = [
+                rank_features(width=ranking, num_to_show=num_to_show)
+                for ranking, num_to_show in zip(rankings, filter_top, strict=False)
+            ]
+
+        column_names_list = list(factuals)
+        factual_values = [factual["value"] for factual in list(factuals.values())]
+
+        # Prepare filename/path/title/save_ext
+        if len(filename) > 0:
+            path, _, title, ext = prepare_for_saving(str(i) + "_" + filename)
+            path = f"plots/{path}"
+            save_ext = [ext]
+        else:
+            path = ""
+            title = ""
+            save_ext = []
+
+        return {
+            "class_explanations_list": list(class_explanations.values()),
+            "factual_values": factual_values,
+            "predicts": predicts,
+            "feature_weights_list": feature_weights_list,
+            "features_list_to_plot": features_list_to_plot,
+            "filter_top": filter_top,
+            "colors": colors,
+            "column_names_list": column_names_list,
+            "title": title,
+            "path": path,
+            "interval": uncertainty,
+            "show": show,
+            "idx": i,
+            "save_ext": save_ext,
+            "style_override": style_override,
+        }

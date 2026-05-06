@@ -13,6 +13,7 @@ from calibrated_explanations.explanations import (
     FrozenCalibratedExplainer,
 )
 from calibrated_explanations.plugins.manager import PluginManager
+from tests.helpers.deprecation import deprecations_error_enabled, warns_or_raises
 
 
 class DummyDomainMapper:
@@ -161,11 +162,39 @@ class DummyExplanation:
         self.calls.append(("ensured", {"include_potential": include_potential, "copy": copy}))
         return self
 
+    def pareto_explanations(
+        self, include_potential=True, copy=True, *, pareto_cost="uncertainty_width"
+    ):
+        self.calls.append(
+            (
+                "pareto",
+                {
+                    "include_potential": include_potential,
+                    "copy": copy,
+                    "pareto_cost": pareto_cost,
+                },
+            )
+        )
+        return self
+
     def filter_rule_sizes(self, *, rule_sizes=None, size_range=None, copy=True):
         self.calls.append(
             (
                 "filter_rule_sizes",
                 {"rule_sizes": rule_sizes, "size_range": size_range, "copy": copy},
+            )
+        )
+        return self
+
+    def filter_features(self, *, exclude_features=None, include_features=None, copy=True):
+        self.calls.append(
+            (
+                "filter_features",
+                {
+                    "exclude_features": exclude_features,
+                    "include_features": include_features,
+                    "copy": copy,
+                },
             )
         )
         return self
@@ -503,11 +532,18 @@ def test_alternative_specific_filters(calibrated_collection):
     alt.semi_explanations(only_ensured=True, include_potential=False)
     alt.counter_explanations(only_ensured=True, include_potential=False)
     alt.ensured_explanations()
+    alt.pareto_explanations(include_potential=False, pareto_cost="rule_size")
     for exp in alt.explanations:
         actions = [
-            call[0] for call in exp.calls if call[0] in {"super", "semi", "counter", "ensured"}
+            call[0]
+            for call in exp.calls
+            if call[0] in {"super", "semi", "counter", "ensured", "pareto"}
         ]
-        assert {"super", "semi", "counter", "ensured"}.issubset(set(actions))
+        assert {"super", "semi", "counter", "ensured", "pareto"}.issubset(set(actions))
+
+        pareto_calls = [call for call in exp.calls if call[0] == "pareto"]
+        assert pareto_calls
+        assert pareto_calls[-1][1]["pareto_cost"] == "rule_size"
 
 
 def test_alternative_specific_filters_inplace(calibrated_collection):
@@ -517,17 +553,20 @@ def test_alternative_specific_filters_inplace(calibrated_collection):
     out_semi = alt.semi_explanations(copy=False)
     out_counter = alt.counter_explanations(copy=False)
     out_ensured = alt.ensured_explanations(copy=False)
+    out_pareto = alt.pareto_explanations(copy=False)
 
     assert out_super is alt
     assert out_semi is alt
     assert out_counter is alt
     assert out_ensured is alt
+    assert out_pareto is alt
     for exp in alt.explanations:
         actions = [call[0] for call in exp.calls]
         assert "super" in actions
         assert "semi" in actions
         assert "counter" in actions
         assert "ensured" in actions
+        assert "pareto" in actions
 
 
 def test_collection_to_json_and_back(calibrated_collection):
@@ -736,6 +775,13 @@ def test_filter_rule_sizes_inplace_mutates_collection(calibrated_collection):
         )
 
 
+def test_filter_features_inplace_mutates_collection(calibrated_collection):
+    out = calibrated_collection.filter_features(exclude_features=0, copy=False)
+    assert out is calibrated_collection
+    for exp in calibrated_collection.explanations:
+        assert any(call[0] == "filter_features" and call[1]["copy"] is False for call in exp.calls)
+
+
 def test_from_batch_full_probabilities_and_instance_validation(calibrated_collection):
     from calibrated_explanations.core import SerializationError, ValidationError
 
@@ -888,15 +934,19 @@ def test_collection_to_narrative_and_plot_style_narrative(monkeypatch, calibrate
 
 
 def test_as_lime_and_shap_transformations(calibrated_collection):
-    lime_explanations = calibrated_collection.as_lime(num_features_to_show=2)
-    assert len(lime_explanations) == len(calibrated_collection)
-    for lime in lime_explanations:
-        assert lime.local_pred is not None
-        assert len(lime.local_exp[1]) == 2
+    with warns_or_raises(match="CalibratedExplanations.as_lime is deprecated"):
+        lime_explanations = calibrated_collection.as_lime(num_features_to_show=2)
+    if not deprecations_error_enabled():
+        assert len(lime_explanations) == len(calibrated_collection)
+        for lime in lime_explanations:
+            assert lime.local_pred is not None
+            assert len(lime.local_exp[1]) == 2
 
-    shap_exp = calibrated_collection.as_shap()
-    assert shap_exp.values.shape[0] == len(calibrated_collection)
-    assert shap_exp.data is calibrated_collection.x_test
+    with warns_or_raises(match="CalibratedExplanations.as_shap is deprecated"):
+        shap_exp = calibrated_collection.as_shap()
+    if not deprecations_error_enabled():
+        assert shap_exp.values.shape[0] == len(calibrated_collection)
+        assert shap_exp.data is calibrated_collection.x_test
 
 
 def test_as_lime_regression_branch():
@@ -908,10 +958,12 @@ def test_as_lime_regression_branch():
             0, x[0], predict=0.42, interval=(0.0, 1.0), feature_weights=[1.0, 2.0, 3.0]
         )
     ]
-    lime = collection.as_lime()
-    assert lime[0].predicted_value == collection.explanations[0].prediction["predict"]
-    assert lime[0].min_value == np.min(dummy_explainer.y_cal)
-    assert lime[0].max_value == np.max(dummy_explainer.y_cal)
+    with warns_or_raises(match="CalibratedExplanations.as_lime is deprecated"):
+        lime = collection.as_lime()
+    if not deprecations_error_enabled():
+        assert lime[0].predicted_value == collection.explanations[0].prediction["predict"]
+        assert lime[0].min_value == np.min(dummy_explainer.y_cal)
+        assert lime[0].max_value == np.max(dummy_explainer.y_cal)
 
 
 def test_class_labels_and_feature_names_cache(calibrated_collection):

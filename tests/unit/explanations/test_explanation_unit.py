@@ -145,6 +145,64 @@ class TestExplanationUnit:
         with pytest.raises(ValidationError):
             expl.filter_rule_sizes(rule_sizes=1, size_range=(1, 2))
 
+    def test_filter_features_copy_preserves_original(self):
+        expl = self.create_expl()
+        expl.rules = {
+            "rule": ["r1", "r2", "r3"],
+            "feature": [0, 1, [0, 1]],
+            "predict": [0.1, 0.2, 0.3],
+            "predict_low": [0.0, 0.1, 0.2],
+            "predict_high": [0.2, 0.3, 0.4],
+            "weight": [0.1, 0.2, 0.3],
+            "weight_low": [0.05, 0.15, 0.25],
+            "weight_high": [0.15, 0.25, 0.35],
+            "value": ["v1", "v2", "v3"],
+            "sampled_values": [1, 2, 3],
+            "feature_value": [10, 20, 30],
+            "is_conjunctive": [False, False, True],
+        }
+        filtered = expl.filter_features(exclude_features=0, copy=True)
+        assert len(filtered.rules["rule"]) == 1
+        assert filtered.rules["rule"] == ["r2"]
+        assert len(expl.rules["rule"]) == 3
+        assert expl.rules["rule"] == ["r1", "r2", "r3"]
+
+    def test_filter_features_include(self):
+        expl = self.create_expl()
+        expl.rules = {
+            "rule": ["r1", "r2", "r3"],
+            "feature": [0, 1, [0, 1]],
+            "predict": [0.1, 0.2, 0.3],
+            "predict_low": [0.0, 0.1, 0.2],
+            "predict_high": [0.2, 0.3, 0.4],
+            "weight": [0.1, 0.2, 0.3],
+            "weight_low": [0.05, 0.15, 0.25],
+            "weight_high": [0.15, 0.25, 0.35],
+            "value": ["v1", "v2", "v3"],
+            "sampled_values": [1, 2, 3],
+            "feature_value": [10, 20, 30],
+            "is_conjunctive": [False, False, True],
+        }
+        filtered = expl.filter_features(include_features=0, copy=True)
+        assert len(filtered.rules["rule"]) == 2
+        assert filtered.rules["rule"] == ["r1", "r3"]  # r1 has 0, r3 has [0,1] so includes 0
+        assert len(expl.rules["rule"]) == 3
+        assert expl.rules["rule"] == ["r1", "r2", "r3"]
+
+    def test_filter_features_validation(self):
+        expl = self.create_expl()
+        with pytest.raises(
+            ValidationError,
+            match="Exactly one of exclude_features or include_features must be provided",
+        ):
+            expl.filter_features()
+        with pytest.raises(ValidationError, match="Features list must not be empty"):
+            expl.filter_features(exclude_features=[])
+        with pytest.raises(ValidationError, match="Feature index 10 is out of range"):
+            expl.filter_features(exclude_features=10)
+        with pytest.raises(ValidationError, match="Feature name 'nonexistent' not found"):
+            expl.filter_features(exclude_features="nonexistent")
+
     # --- Tests for add_new_rule_condition ---
 
     def test_add_new_rule_condition_invalid_feature(self):
@@ -186,6 +244,24 @@ class TestExplanationUnit:
 
         assert len(expl.rules["rule"]) == 1
         assert expl.rules["rule"][0] == "f0 > 8.00"
+
+    def test_get_rules_after_add_new_rule_condition_retains_added_rule(self):
+        """get_rules() must not discard rules added by add_new_rule_condition (regression)."""
+        expl = self.create_expl()
+
+        def predict_diff_effect(x, **kwargs):
+            n = len(x)
+            return (np.zeros(n) + 0.5, np.zeros(n) + 0.3, np.zeros(n) + 0.7, None)
+
+        self.explainer.prediction_orchestrator.predict_internal = Mock(
+            side_effect=predict_diff_effect
+        )
+
+        expl.add_new_rule_condition(0, 8.0)
+        rules_after_add = expl.get_rules()  # must NOT rebuild from scratch
+
+        assert len(rules_after_add["rule"]) == 1
+        assert rules_after_add["rule"][0] == "f0 > 8.00"
 
     def test_add_new_rule_condition_identical_prediction(self):
         expl = self.create_expl()
@@ -294,8 +370,8 @@ class TestRuleWithImpact:
             base_predict=0.8,
             predict=2.0,
             value="> 0.5",
-            uncertainty_low=1.0,
-            uncertainty_high=1.4,
+            weight_envelope_low=1.0,
+            weight_envelope_high=1.4,
             predict_low=1.8,
             predict_high=2.2,
         )
@@ -308,8 +384,8 @@ class TestRuleWithImpact:
         assert rule.base_predict == 0.8
         assert rule.predict == 2.0
         assert rule.value == "> 0.5"
-        assert rule.uncertainty_low == 1.0
-        assert rule.uncertainty_high == 1.4
+        assert rule.weight_envelope_low == 1.0
+        assert rule.weight_envelope_high == 1.4
         assert rule.predict_low == 1.8
         assert rule.predict_high == 2.2
 
@@ -328,8 +404,8 @@ class TestRuleWithImpact:
             value="<= 0.3",
         )
 
-        assert rule.uncertainty_low is None
-        assert rule.uncertainty_high is None
+        assert rule.weight_envelope_low is None
+        assert rule.weight_envelope_high is None
         assert rule.predict_low is None
         assert rule.predict_high is None
 
@@ -347,8 +423,8 @@ def test_rule_with_impact_dataclass():
         base_predict=1.0,
         predict=2.0,
         value="> 0.5",
-        uncertainty_low=1.0,
-        uncertainty_high=1.4,
+        weight_envelope_low=1.0,
+        weight_envelope_high=1.4,
         predict_low=1.8,
         predict_high=2.2,
     )
@@ -361,7 +437,7 @@ def test_rule_with_impact_dataclass():
     assert rule.base_predict == 1.0
     assert rule.predict == 2.0
     assert rule.value == "> 0.5"
-    assert rule.uncertainty_low == 1.0
-    assert rule.uncertainty_high == 1.4
+    assert rule.weight_envelope_low == 1.0
+    assert rule.weight_envelope_high == 1.4
     assert rule.predict_low == 1.8
     assert rule.predict_high == 2.2

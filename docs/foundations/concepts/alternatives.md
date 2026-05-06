@@ -1,16 +1,44 @@
-# Alternatives and triangular plots
+# Alternative explanations and ensured filters
 
-Alternative explanations quantify how predictions and uncertainty move when you
-adjust feature values. Use them alongside the triangular plot to stay aligned
-with calibrated decision boundaries.
+Alternative explanations show how feature changes may change predictions.
 
-1. Start from the same calibrated explainer used in the quickstarts.
-2. Call `explore_alternatives` to generate candidate rules and uncertainty
-   intervals for each scenario.
-3. Plot the batch with `style="triangular"` to compare the calibrated base point
-   (red) against the alternative set (blue).
+Semantics and non-guarantees are defined in
+{doc}`calibrated_interval_semantics`.
 
-> 🧭 **Interpretation link:** Revisit the
-> {doc}`../how-to/interpret_explanations` guide for a narrated walkthrough of the
-> triangular overlays, rule ranking heuristics, and how probabilistic and
-> interval regression appear side by side.
+## Generate alternatives
+
+```python
+alternatives = explainer.explore_alternatives(X_query)
+alt0 = alternatives[0]
+```
+
+For probabilistic regression:
+
+```python
+alternatives = explainer.explore_alternatives(X_query, threshold=150.0)
+```
+
+## Ensured filters
+
+The alternative object supports these filters:
+
+- `super_explanations()`
+- `semi_explanations()`
+- `counter_explanations()`
+- `ensured_explanations()`
+- `pareto_explanations()`
+
+## Plotting and conjunctions
+
+```python
+alt0.add_conjunctions(n_top_features=5, max_rule_size=2)
+alt0.plot(style="triangular", show=False)
+```
+
+## Related pages
+
+- {doc}`../../practitioner/playbooks/ensured-explanations`
+- {doc}`../how-to/interpret_explanations`
+- {doc}`guarded_explanations`
+
+Entry-point tier: Tier 3.

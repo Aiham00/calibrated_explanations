@@ -13,6 +13,7 @@ from .discretizers import (
     EntropyDiscretizer,
     RegressorDiscretizer,
 )
+from .distribution_guard import InDistributionGuard
 from .helper import (
     assert_threshold,
     calculate_metrics,
@@ -62,6 +63,7 @@ _ensure_joblib_pool_attribute()
 __all__ = [
     "assert_threshold",
     "BinaryEntropyDiscretizer",
+    "InDistributionGuard",
     "BinaryRegressorDiscretizer",
     "calculate_metrics",
     "categorical_perturbation",

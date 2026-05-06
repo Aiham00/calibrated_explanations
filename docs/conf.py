@@ -31,10 +31,10 @@ copyright = "2023, Helena Löfström, Tuwe Löfström"
 author = "Helena Löfström, Tuwe Löfström"
 
 # The short X.Y version
-version = "0.10"
+version = "0.11"
 
 # The full version, including alpha/beta/rc tags
-release = "0.10.4"
+release = "0.11.1"
 
 # -- General configuration ---------------------------------------------------
 
@@ -108,6 +108,19 @@ if shutil.which("pandoc") is None:
 # Skip specific GitHub targets that consistently hit rate limits during local linkcheck runs.
 linkcheck_ignore = [
     r"https://github.com/Moffran/calibrated_explanations/blob/main/CHANGELOG\.md",
+    # Some internal skill docs and large assets are hosted in the repo under
+    # `.claude/skills/`. These links can hit rate limits on GitHub or be
+    # transiently unavailable from CI linkcheck runners; ignore them here so
+    # linkcheck focuses on public-facing documentation links.
+    r"https://github.com/Moffran/calibrated_explanations/blob/main/\.claude/.*",
+    r"https://raw.githubusercontent.com/Moffran/calibrated_explanations/main/\.claude/.*",
+    # GitHub-hosted notebook files sometimes hit rate limits during CI linkcheck
+    # runs; ignore repo-hosted notebooks to avoid transient failures.
+    r"https://github.com/Moffran/calibrated_explanations/blob/main/notebooks/.*",
+    r"https://raw.githubusercontent.com/Moffran/calibrated_explanations/main/notebooks/.*",
+    # External academic portals can be flaky / time out from CI linkcheck runners
+    # Ignore diva-portal host to avoid transient timeouts causing CI failures.
+    r"https://www.diva-portal.org/.*",
 ]
 
 # Pygments style for syntax highlighting

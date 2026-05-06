@@ -50,14 +50,21 @@ def _run_step(step: Step) -> int:
     print(f"$ {cmd_text}")
     env = dict(os.environ)
     env.setdefault("PRE_COMMIT_HOME", str(Path(".cache/pre-commit").resolve()))
-    if _is_pre_commit_step(step):
-        result = subprocess.run(step.command, check=False, env=env, capture_output=True, text=True)
-        if result.stdout:
-            print(result.stdout, end="" if result.stdout.endswith("\n") else "\n")
-        if result.stderr:
-            print(result.stderr, end="" if result.stderr.endswith("\n") else "\n")
-    else:
-        result = subprocess.run(step.command, check=False, env=env)
+    try:
+        if _is_pre_commit_step(step):
+            result = subprocess.run(step.command, check=False, env=env, capture_output=True, text=True)
+            if result.stdout:
+                print(result.stdout, end="" if result.stdout.endswith("\n") else "\n")
+            if result.stderr:
+                print(result.stderr, end="" if result.stderr.endswith("\n") else "\n")
+        else:
+            result = subprocess.run(step.command, check=False, env=env)
+    except FileNotFoundError as exc:
+        if step.optional:
+            print(f"Step skipped (optional command unavailable): {step.name} ({exc})")
+            return 0
+        print(f"ERROR: required command unavailable for step '{step.name}': {exc}")
+        return 127
     if result.returncode == 0:
         return 0
     # Pre-commit may fail due to network fetch issues in restricted/offline
@@ -109,6 +116,12 @@ def _is_network_fetch_failure(stderr: str) -> bool:
     return False
 
 
+def _pytest_supports_no_cov() -> bool:
+    """Return True if pytest supports the --no-cov option."""
+    result = subprocess.run([sys.executable, "-m", "pytest", "--help"], check=False, capture_output=True, text=True)
+    return "--no-cov" in (result.stdout or "")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run CI-equivalent checks locally in current env.")
     parser.add_argument(
@@ -116,31 +129,112 @@ def main() -> int:
         action="store_true",
         help="Run PR checks only (skip main-branch checks such as coverage/perf/over-testing).",
     )
+    parser.add_argument(
+        "--ci-parity",
+        action="store_true",
+        help="Run docs/linkcheck in strict CI parity mode (make linkcheck fatal).",
+    )
     args = parser.parse_args()
 
-    if shutil.which("mypy") is None:
+    # CI-parity mode: dynamically read CI workflows and run them locally.
+    if args.ci_parity:
+        print("CI parity mode: delegating to scripts/run_ci_locally.py (dynamic workflow runner)")
+        # Prefer bash to emulate GitHub Actions Linux runners; fall back to pwsh on Windows.
+        shell_arg = "bash"
+        if os.name == "nt":
+            shell_arg = "bash"
+        # Pre-clean any stale coverage database files which can cause sqlite schema
+        # errors when pytest-cov writes coverage data from parallel runs.
+        try:
+            for cov in Path('.').glob('.coverage*'):
+                try:
+                    cov.unlink()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        rc = subprocess.call([sys.executable, "scripts/run_ci_locally.py", "--shell", shell_arg])
+        return rc
+
+    mypy_available = shutil.which("mypy") is not None or subprocess.call(
+        [sys.executable, "-m", "mypy", "--version"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    ) == 0
+    if not mypy_available:
         print("ERROR: mypy not found in current environment.")
         return 2
-    if shutil.which("pre-commit") is None:
-        print("ERROR: pre-commit not found in current environment.")
-        return 2
+    pre_commit_available = shutil.which("pre-commit") is not None
+    if not pre_commit_available:
+        print("WARNING: pre-commit not found in current environment; skipping pre-commit step.")
 
     mypy_targets = _mypy_targets()
     if not mypy_targets:
         print("No mypy target files found; skipping mypy step.")
 
+    nbqa_available = shutil.which("nbqa") is not None
+    pydocstyle_available = shutil.which("pydocstyle") is not None
+    if not nbqa_available:
+        print("WARNING: nbqa not found in current environment; skipping notebook naming lint step.")
+    if not pydocstyle_available:
+        print("WARNING: pydocstyle not found in current environment; skipping pydocstyle step.")
+
+    core_test_command = [sys.executable, "-m", "pytest", "-q", "-m", "not viz", "-o", "addopts="]
+    if _pytest_supports_no_cov():
+        core_test_command.append("--no-cov")
+    else:
+        print("WARNING: pytest-cov/--no-cov unavailable; running core tests without --no-cov.")
+
     pr_steps: list[Step] = [
-        Step("Pre-commit", ["pre-commit", "run", "--all-files"]),
-        Step("Ruff naming", ["ruff", "check", "--select", "N"]),
-        Step("Notebook naming lint", _python_cmd("-m", "nbqa", "ruff", "notebooks", "--select", "N")),
-        Step("Pydocstyle", ["pydocstyle", "src", "tests"]),
+        Step("Ruff naming", _python_cmd("-m", "ruff", "check", "--select", "N")),
         Step(
             "Docstring coverage",
             _python_cmd("scripts/quality/check_docstring_coverage.py", "--fail-under", "94.0"),
         ),
         Step("ADR-001 boundary check", _python_cmd("scripts/quality/check_import_graph.py")),
         Step("ADR-002 compliance check", _python_cmd("scripts/quality/check_adr002_compliance.py")),
-        Step("Core tests (no viz/no cov)", ["pytest", "-q", "-m", "not viz", "--no-cov"]),
+        Step(
+            "ADR-028 governance event schema check",
+            _python_cmd("scripts/quality/check_governance_event_schema.py"),
+        ),
+        Step(
+            "STD-005 logger domain enforcement",
+            _python_cmd(
+                "scripts/quality/check_logging_domains.py",
+                "--root",
+                "src/calibrated_explanations",
+                "--report",
+                "reports/quality/logging_domain_report.json",
+            ),
+        ),
+        Step(
+            "STD-001 nomenclature enforcement",
+            _python_cmd(
+                "scripts/quality/check_std001_nomenclature.py",
+                "--root",
+                "src/calibrated_explanations",
+                "--report",
+                "reports/nomenclature_violation_inventory.json",
+                "--check",
+            ),
+        ),
+        Step(
+            "Agent instruction consistency",
+            _python_cmd("scripts/quality/check_agent_instruction_consistency.py"),
+        ),
+        Step(
+            "CI policy workflow validation (advisory)",
+            _python_cmd(
+                "scripts/quality/validate_ci_policy.py",
+                "--base-sha",
+                "HEAD~1",
+                "--head-sha",
+                "HEAD",
+                "--advisory",
+            ),
+            optional=True,
+        ),
+        Step("Core tests (no viz/no cov)", core_test_command),
         Step("Private-member scan", _python_cmd("scripts/anti-pattern-analysis/scan_private_usage.py", "tests", "--check")),
         Step(
             "ADR-030 anti-pattern detector",
@@ -158,6 +252,40 @@ def main() -> int:
             ),
         ),
         Step(
+            "ADR-030 test-helper export guard",
+            _python_cmd(
+                "scripts/quality/check_no_test_helper_exports.py",
+                "--root",
+                "src/calibrated_explanations",
+                "--report",
+                "reports/anti-pattern-analysis/test_helper_wrapper_report.json",
+            ),
+        ),
+        Step(
+            "ADR-006 trust-mutation primitive guard",
+            _python_cmd(
+                "scripts/quality/check_trust_mutation_primitive.py",
+                "--root",
+                "src/calibrated_explanations",
+                "--report",
+                "reports/trust_mutation_inventory.json",
+                "--check",
+            ),
+        ),
+        Step(
+            "ADR-034 ConfigManager usage guard",
+            _python_cmd(
+                "scripts/quality/check_config_manager_usage.py",
+                "--root",
+                "src/calibrated_explanations",
+                "--scope",
+                "runtime",
+                "--report",
+                "reports/quality/config_manager_usage_report.json",
+                "--check",
+            ),
+        ),
+        Step(
             "ADR-030 marker hygiene",
             _python_cmd(
                 "scripts/quality/check_marker_hygiene.py",
@@ -168,18 +296,39 @@ def main() -> int:
                 ".github/marker-hygiene-baseline.json",
             ),
         ),
+        Step(
+            "Generated report local-path guard",
+            _python_cmd(
+                "scripts/quality/check_no_local_paths_in_reports.py",
+                "--check",
+                "--report",
+                "reports/quality/no_local_paths_report.json",
+            ),
+        ),
     ]
+
+    if pre_commit_available:
+        pr_steps.insert(0, Step("Pre-commit", ["pre-commit", "run", "--all-files"]))
+    if nbqa_available:
+        pr_steps.insert(2 if pre_commit_available else 1, Step("Notebook naming lint", _python_cmd("-m", "nbqa", "ruff", "notebooks", "--select", "N")))
+    if pydocstyle_available:
+        insert_at = 3 if pre_commit_available and nbqa_available else 2 if (pre_commit_available or nbqa_available) else 1
+        pr_steps.insert(insert_at, Step("Pydocstyle", ["pydocstyle", "src", "tests"]))
 
     if mypy_targets:
         pr_steps.insert(
             6,
             Step(
                 "Mypy (Phase 1B scope)",
-                ["mypy", *mypy_targets, "--config-file", "pyproject.toml"],
+                _python_cmd("-m", "mypy", *mypy_targets, "--config-file", "pyproject.toml"),
             ),
         )
 
     # Additional PR-scoped CI checks mirrored from workflows
+    deprecation_test_args = [sys.executable, "-m", "pytest", "tests/unit", "-m", "not viz", "-q", "--maxfail=1"]
+    if _pytest_supports_no_cov():
+        deprecation_test_args.append("--no-cov")
+
     optional_pr_steps: list[Step] = [
             # Deprecation-sensitive tests (treat deprecations as errors)
             Step(
@@ -189,7 +338,7 @@ def main() -> int:
                     (
                         "import os,sys,subprocess;"
                         "os.environ.setdefault('CE_DEPRECATIONS','error');"
-                        "sys.exit(subprocess.call(['pytest','tests/unit','-m','not viz','-q','--maxfail=1','--no-cov']))"
+                        f"sys.exit(subprocess.call({deprecation_test_args!r}))"
                     ),
                 ),
                 optional=True,
@@ -214,23 +363,44 @@ def main() -> int:
                 _python_cmd("scripts/quality/audit_notebook_api.py", "notebooks", "--json", "artifacts/notebook_audit.json"),
                 optional=True,
             ),
+            # Notebook execution report (advisory locally — mirrors nightly CI job)
+            # Requires calibrated_explanations[notebooks,viz].
+            Step(
+                "Notebook execution report",
+                _python_cmd(
+                    "scripts/docs/run_notebooks.py",
+                    "--mode",
+                    "advisory",
+                    "--output",
+                    "reports/docs/notebook_execution_report.json",
+                ),
+                optional=True,
+            ),
             # Docs build (advisory locally)
             Step(
                 "Docs build (HTML)",
-                ["sphinx-build", "-b", "html", "docs", "docs/_build/html"],
-                optional=True,
+                [sys.executable, "-m", "sphinx", "-b", "html", "docs", "docs/_build/html"],
+                optional=not args.ci_parity,
             ),
             Step(
                 "Docs linkcheck",
-                ["sphinx-build", "-b", "linkcheck", "docs", "docs/_build/linkcheck"],
-                optional=True,
+                [
+                    sys.executable, "-m", "sphinx",
+                    "-b",
+                    "linkcheck",
+                    "-D",
+                    "nbsphinx_execute=never",
+                    "docs",
+                    "docs/_build/linkcheck",
+                ],
+                optional=not args.ci_parity,
             ),
         ]
     if Path("tests/examples").exists():
         optional_pr_steps.append(
             Step(
                 "Examples smoke",
-                ["pytest", "-q", "tests/examples"],
+                [sys.executable, "-m", "pytest", "-q", "tests/examples"],
                 optional=True,
             )
         )
@@ -258,13 +428,13 @@ def main() -> int:
         ),
         Step(
             "Docs build (main)",
-            ["sphinx-build", "-b", "html", "docs", "docs/_build/html"],
+            [sys.executable, "-m", "sphinx", "-b", "html", "docs", "docs/_build/html"],
             optional=True,
         ),
         Step(
             "Core tests with coverage",
             [
-                "pytest",
+                sys.executable, "-m", "pytest",
                 "-q",
                 "-o",
                 "addopts=",
@@ -304,6 +474,27 @@ def main() -> int:
             ),
         ),
         Step(
+            "ADR-030 test-helper export guard (main)",
+            _python_cmd(
+                "scripts/quality/check_no_test_helper_exports.py",
+                "--root",
+                "src/calibrated_explanations",
+                "--report",
+                "reports/anti-pattern-analysis/test_helper_wrapper_report.json",
+            ),
+        ),
+        Step(
+            "ADR-006 trust-mutation primitive guard (main)",
+            _python_cmd(
+                "scripts/quality/check_trust_mutation_primitive.py",
+                "--root",
+                "src/calibrated_explanations",
+                "--report",
+                "reports/trust_mutation_inventory.json",
+                "--check",
+            ),
+        ),
+        Step(
             "ADR-030 marker hygiene (main)",
             _python_cmd(
                 "scripts/quality/check_marker_hygiene.py",
@@ -315,9 +506,43 @@ def main() -> int:
             ),
         ),
         Step(
+            "Generated report local-path guard (main)",
+            _python_cmd(
+                "scripts/quality/check_no_local_paths_in_reports.py",
+                "--check",
+                "--report",
+                "reports/quality/no_local_paths_report.json",
+            ),
+        ),
+        Step(
+            "ADR-028 governance event schema check (main)",
+            _python_cmd("scripts/quality/check_governance_event_schema.py"),
+        ),
+        Step(
+            "STD-005 logger domain enforcement (main)",
+            _python_cmd(
+                "scripts/quality/check_logging_domains.py",
+                "--root",
+                "src/calibrated_explanations",
+                "--report",
+                "reports/quality/logging_domain_report.json",
+            ),
+        ),
+        Step(
+            "STD-001 nomenclature enforcement (main)",
+            _python_cmd(
+                "scripts/quality/check_std001_nomenclature.py",
+                "--root",
+                "src/calibrated_explanations",
+                "--report",
+                "reports/nomenclature_violation_inventory.json",
+                "--check",
+            ),
+        ),
+        Step(
             "Over-testing coverage contexts",
             [
-                "pytest",
+                sys.executable, "-m", "pytest",
                 "-q",
                 "-o",
                 "addopts=",
@@ -353,10 +578,11 @@ def main() -> int:
             return rc
 
     if args.skip_main:
-        final_precommit = Step("Pre-commit (final verification)", ["pre-commit", "run", "--all-files"])
-        rc = _run_step(final_precommit)
-        if rc != 0:
-            return rc
+        if pre_commit_available:
+            final_precommit = Step("Pre-commit (final verification)", ["pre-commit", "run", "--all-files"])
+            rc = _run_step(final_precommit)
+            if rc != 0:
+                return rc
         print("\nLocal checks completed (PR scope).")
         return 0
 
@@ -369,10 +595,11 @@ def main() -> int:
         if rc != 0:
             return rc
 
-    final_precommit = Step("Pre-commit (final verification)", ["pre-commit", "run", "--all-files"])
-    rc = _run_step(final_precommit)
-    if rc != 0:
-        return rc
+    if pre_commit_available:
+        final_precommit = Step("Pre-commit (final verification)", ["pre-commit", "run", "--all-files"])
+        rc = _run_step(final_precommit)
+        if rc != 0:
+            return rc
 
     print("\nLocal checks completed (PR + main scope).")
     return 0

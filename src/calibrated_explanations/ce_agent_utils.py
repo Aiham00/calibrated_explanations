@@ -13,6 +13,7 @@ import inspect
 import json
 import logging
 import warnings
+from collections import Counter
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
@@ -143,6 +144,7 @@ def _require_ce() -> type:
 
 
 def _is_wrapper(obj: Any, wrap_cls: type) -> bool:
+    """Return ``True`` when ``obj`` is an instance of the CE wrapper class."""
     return isinstance(obj, wrap_cls)
 
 
@@ -157,6 +159,7 @@ def serialize_policy() -> str:
 
 
 def _supports_kwarg(callable_obj: Callable[..., Any], kwarg: str) -> bool:
+    """Check whether a callable accepts a named keyword argument."""
     try:
         signature = inspect.signature(callable_obj)
     except (TypeError, ValueError):
@@ -170,6 +173,7 @@ def _supports_kwarg(callable_obj: Callable[..., Any], kwarg: str) -> bool:
 
 
 def _filter_kwargs(callable_obj: Callable[..., Any], kwargs: Mapping[str, Any]) -> Dict[str, Any]:
+    """Filter kwargs to those supported by ``callable_obj``."""
     if not kwargs:
         return {}
     if _supports_kwarg(callable_obj, "kwargs"):
@@ -183,6 +187,7 @@ def _filter_kwargs(callable_obj: Callable[..., Any], kwargs: Mapping[str, Any]) 
 
 
 def _ensure_required_methods(wrapper: Any, required: Iterable[str]) -> None:
+    """Raise when required wrapper methods are missing."""
     missing = [name for name in required if not hasattr(wrapper, name)]
     if missing:
         raise ModelNotSupportedError(
@@ -192,6 +197,7 @@ def _ensure_required_methods(wrapper: Any, required: Iterable[str]) -> None:
 
 
 def _ensure_required_attrs(wrapper: Any, required: Iterable[str]) -> None:
+    """Raise when required wrapper attributes are missing."""
     missing = [name for name in required if not hasattr(wrapper, name)]
     if missing:
         raise ModelNotSupportedError(
@@ -203,6 +209,7 @@ def _ensure_required_attrs(wrapper: Any, required: Iterable[str]) -> None:
 def _validate_wrapper_state(
     wrapper: Any, *, require_fitted: bool = True, require_calibrated: bool = True
 ) -> None:
+    """Validate fitted/calibrated state flags on the CE wrapper."""
     if require_fitted and not getattr(wrapper, "fitted", False):
         raise NotFittedError(
             CE_FIRST_POLICY["failure_messages"]["not_fitted"],
@@ -282,11 +289,13 @@ def fit_and_calibrate(
 
 
 def _safe_call_with_kwargs(callable_obj: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+    """Invoke a callable after dropping unsupported keyword arguments."""
     filtered = _filter_kwargs(callable_obj, kwargs)
     return callable_obj(*args, **filtered)
 
 
 def _extract_top_features(explanation: Any, top_k: int = 3) -> List[str]:
+    """Extract top-ranked rule texts from an explanation payload."""
     if explanation is None:
         return []
     rules = None
@@ -313,6 +322,7 @@ def _extract_top_features(explanation: Any, top_k: int = 3) -> List[str]:
 
 
 def _format_probability(proba: Any) -> str:
+    """Format probability-like values for narrative output."""
     if proba is None:
         return "n/a"
     if isinstance(proba, (list, tuple, np.ndarray)):
@@ -327,12 +337,14 @@ def _format_probability(proba: Any) -> str:
 
 
 def _format_interval(interval: Any) -> str:
+    """Format interval-like values for narrative output."""
     if interval is None:
         return "n/a"
     return str(interval)
 
 
 def _extract_prediction_triplet(prediction: Any) -> Optional[Tuple[Any, Any, Any]]:
+    """Extract ``(predict, low, high)`` from prediction mappings when present."""
     if not isinstance(prediction, Mapping):
         return None
     if all(key in prediction for key in ("predict", "low", "high")):
@@ -400,6 +412,176 @@ def summarize_explanations(explanations: Any, *, top_k: int = 5) -> Mapping[str,
         "confidence": confidence,
         "y_threshold": y_threshold,
     }
+
+
+def _coerce_guarded_audit_payload(audit_or_obj: Any) -> Mapping[str, Any]:
+    """Normalize guarded audit input to a payload mapping."""
+    if isinstance(audit_or_obj, Mapping):
+        return audit_or_obj
+    getter = getattr(audit_or_obj, "get_guarded_audit", None)
+    if callable(getter):
+        payload = getter()
+        if isinstance(payload, Mapping):
+            return payload
+    raise ValidationError(
+        "Expected guarded audit mapping or object exposing get_guarded_audit().",
+        details={"input_type": type(audit_or_obj).__name__},
+    )
+
+
+def format_guarded_audit_table(
+    audit_or_obj: Any,
+    *,
+    max_rows: int = 30,
+    bound_decimals: int = 4,
+    pvalue_decimals: int = 4,
+    include_reason_legend: bool = True,
+) -> str:
+    """Format guarded audit payload into a compact text table.
+
+    Parameters
+    ----------
+    audit_or_obj : Any
+        A guarded audit payload dict, a guarded explanation, or a guarded collection.
+    max_rows : int, default=30
+        Maximum number of interval rows to render.
+    bound_decimals : int, default=4
+        Decimal precision for interval bounds and representative values.
+    pvalue_decimals : int, default=4
+        Decimal precision for p-values.
+    include_reason_legend : bool, default=True
+        Append compact reason counts and a legend to aid interpretation.
+
+    Returns
+    -------
+    str
+        A compact multi-line table with summary and interval rows.
+    """
+    payload = _coerce_guarded_audit_payload(audit_or_obj)
+    rows: List[Mapping[str, Any]] = []
+    summary: Mapping[str, Any] = payload.get("summary", {})
+    n_instances = summary.get("n_instances")
+
+    if isinstance(payload.get("instances"), list):
+        for inst in payload["instances"]:
+            inst_idx = int(inst.get("instance_index", -1))
+            for rec in inst.get("intervals", []) or []:
+                rows.append({"instance_index": inst_idx, **rec})
+    else:
+        inst_idx = int(payload.get("instance_index", -1))
+        for rec in payload.get("intervals", []) or []:
+            rows.append({"instance_index": inst_idx, **rec})
+        n_instances = 1 if n_instances is None else n_instances
+
+    def _fmt_num(value: Any, *, decimals: int) -> str:
+        if value is None:
+            return ""
+        try:
+            fval = float(value)
+        except (TypeError, ValueError):
+            return str(value)
+        if np.isnan(fval):
+            return "nan"
+        if np.isposinf(fval):
+            return "inf"
+        if np.isneginf(fval):
+            return "-inf"
+        text = f"{fval:.{max(0, int(decimals))}f}"
+        if "." in text:
+            text = text.rstrip("0").rstrip(".")
+        return text
+
+    def _fmt_interval(lower: Any, upper: Any) -> str:
+        lower_str = _fmt_num(lower, decimals=bound_decimals)
+        upper_str = _fmt_num(upper, decimals=bound_decimals)
+        return f"({lower_str}, {upper_str}]"
+
+    def _interval_bounds(rec: Mapping[str, Any]) -> tuple:
+        """Return (lower, upper) to display."""
+        return rec.get("lower"), rec.get("upper")
+
+    header = "inst feat name                interval                  p      conf emit mrg  reason"
+    divider = "-" * len(header)
+    lines = [
+        "Guarded Audit Summary",
+        (
+            f"instances={int(n_instances) if n_instances is not None else '?'} "
+            f"tested={summary.get('intervals_tested', 0)} "
+            f"conforming={summary.get('intervals_conforming', 0)} "
+            f"removed_guard={summary.get('intervals_removed_guard', 0)} "
+            f"emitted={summary.get('intervals_emitted', 0)}"
+        ),
+        header,
+        divider,
+    ]
+
+    limited = rows[: max(0, int(max_rows))]
+    for rec in limited:
+        name = str(rec.get("feature_name", ""))[:18]
+        disp_lower, disp_upper = _interval_bounds(rec)
+        interval = _fmt_interval(disp_lower, disp_upper)[:24]
+        p_val = rec.get("p_value", "")
+        p_str = _fmt_num(p_val, decimals=pvalue_decimals) if p_val not in ("", None) else ""
+        conf = "Y" if rec.get("conforming") else "N"
+        emit = "Y" if rec.get("emitted") else "N"
+        mrg = "Y" if rec.get("is_merged") else "N"
+        reason = str(rec.get("emission_reason", ""))[:18]
+        lines.append(
+            f"{int(rec.get('instance_index', -1)):>4} "
+            f"{int(rec.get('feature', -1)):>4} "
+            f"{name:<18} "
+            f"{interval:<24} "
+            f"{p_str:>6} "
+            f"{conf:^4} "
+            f"{emit:^4} "
+            f"{mrg:^4} "
+            f"{reason}"
+        )
+
+    if len(rows) > len(limited):
+        lines.append(f"... truncated {len(rows) - len(limited)} row(s)")
+    if include_reason_legend:
+        reason_counts = Counter(str(rec.get("emission_reason", "")) for rec in rows)
+        known_order = [
+            "emitted",
+            "removed_guard",
+            "design_excluded",
+            "baseline_equal",
+            "zero_impact",
+            "ignored_feature",
+        ]
+        counts = [f"{key}={reason_counts[key]}" for key in known_order if reason_counts.get(key, 0)]
+        if counts:
+            lines.append("reason_counts: " + ", ".join(counts))
+        lines.append(
+            "legend: emitted=rule kept; removed_guard=non-conforming; "
+            "design_excluded=not eligible in this mode; "
+            "baseline_equal=no prediction change; "
+            "zero_impact=factual equals base; "
+            "ignored_feature=explicitly ignored; "
+            "mrg=Y: merged adjacent bins; emitted bounds shown"
+        )
+    return "\n".join(lines)
+
+
+def print_guarded_audit_table(
+    audit_or_obj: Any,
+    *,
+    max_rows: int = 30,
+    bound_decimals: int = 4,
+    pvalue_decimals: int = 4,
+    include_reason_legend: bool = True,
+) -> None:
+    """Print a compact guarded audit table."""
+    print(
+        format_guarded_audit_table(
+            audit_or_obj,
+            max_rows=max_rows,
+            bound_decimals=bound_decimals,
+            pvalue_decimals=pvalue_decimals,
+            include_reason_legend=include_reason_legend,
+        )
+    )
 
 
 def _action_suggestion(weights: List[float], rules: List[str]) -> str:
@@ -733,6 +915,8 @@ __all__ = [
     "explain_and_narrate",
     "explain_and_summarize",
     "summarize_explanations",
+    "format_guarded_audit_table",
+    "print_guarded_audit_table",
     "add_conjunctions",
     "add_conjunctions_to_one",
     "get_calibrated_predictions",

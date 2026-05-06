@@ -1,7 +1,7 @@
 {
   "summary": {
-    "total": 16,
-    "compliant": 16,
+    "total": 18,
+    "compliant": 18,
     "failed": 0
   },
   "notebooks": [
@@ -24,6 +24,22 @@
       ]
     },
     {
+      "path": "notebooks/quickstart_guarded.ipynb",
+      "compliant": true,
+      "violations": [],
+      "usage": [
+        "add_conjunctions",
+        "calibrate",
+        "explain_factual",
+        "explainer",
+        "fit",
+        "learner",
+        "plot",
+        "predict",
+        "predict_proba"
+      ]
+    },
+    {
       "path": "notebooks/quickstart_tiny.ipynb",
       "compliant": true,
       "violations": [],
@@ -31,7 +47,6 @@
         "calibrate",
         "explain_factual",
         "fit",
-        "get_explanation",
         "plot"
       ]
     },
@@ -83,6 +98,7 @@
         "explain_factual",
         "explainer",
         "fit",
+        "initialize_reject_learner",
         "predict",
         "predict_proba"
       ]
@@ -97,7 +113,6 @@
         "explain_factual",
         "explore_alternatives",
         "fit",
-        "get_explanation",
         "plot",
         "remove_conjunctions"
       ]
@@ -139,7 +154,6 @@
         "explain_factual",
         "explore_alternatives",
         "fit",
-        "get_explanation",
         "plot",
         "predict_proba"
       ]
@@ -213,7 +227,6 @@
         "calibrate",
         "explain_factual",
         "fit",
-        "get_explanation",
         "plot",
         "predict",
         "predict_proba",
@@ -233,6 +246,20 @@
         "plot",
         "predict",
         "predict_proba"
+      ]
+    },
+    {
+      "path": "notebooks/paper_based/ensured.ipynb",
+      "compliant": true,
+      "violations": [],
+      "usage": [
+        "add_conjunctions",
+        "calibrate",
+        "explore_alternatives",
+        "fit",
+        "learner",
+        "plot",
+        "set_difficulty_estimator"
       ]
     }
   ]

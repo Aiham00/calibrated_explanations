@@ -1,4 +1,3 @@
-import os
 from types import MappingProxyType
 
 import pytest
@@ -7,7 +6,6 @@ from calibrated_explanations.plugins import (
     find_explanation_descriptor,
     find_explanation_plugin_trusted,
     register_explanation_plugin,
-    clear_explanation_plugins,
     ensure_builtin_plugins,
 )
 from calibrated_explanations.plugins.manager import PluginManager
@@ -16,6 +14,7 @@ from calibrated_explanations.utils.exceptions import ConfigurationError
 from calibrated_explanations.plugins.explanations import ExplainerHandle
 from calibrated_explanations.plugins import ExplanationBatch
 from calibrated_explanations.explanations.explanations import CalibratedExplanations
+from tests.support.registry_helpers import clear_env_trust_cache, clear_explanation_plugins
 
 
 def test_core_fast_plugin_registered_and_trusted():
@@ -28,7 +27,9 @@ def test_core_fast_plugin_registered_and_trusted():
     assert plugin is not None
 
 
-def test_registry_respects_denylist_on_resolution_and_explicit_override_allows_untrusted():
+def test_registry_respects_denylist_on_resolution_and_explicit_override_allows_untrusted(
+    monkeypatch,
+):
     """When identifier is denied via CE_DENY_PLUGIN resolution must fail; explicit override warns but allows."""
     # Ensure a clean registry
     clear_explanation_plugins()
@@ -65,6 +66,10 @@ def test_registry_respects_denylist_on_resolution_and_explicit_override_allows_u
     # Register the plugin (untrusted by default since not builtin and no operator trust)
     register_explanation_plugin(identifier, DummyPlugin(), source="external")
 
+    # Denylist must be set before manager construction due ConfigManager snapshot semantics.
+    monkeypatch.setenv("CE_DENY_PLUGIN", identifier)
+    clear_env_trust_cache()
+
     # Create dummy explainer with plugin manager and orchestrator
     class DummyExplainerObj:
         def __init__(self):
@@ -83,10 +88,11 @@ def test_registry_respects_denylist_on_resolution_and_explicit_override_allows_u
     orch = ExplanationOrchestrator(expl)
 
     # Deny via env should cause ConfigurationError when resolving preferred identifier
-    os.environ["CE_DENY_PLUGIN"] = identifier
     with pytest.raises(ConfigurationError):
         orch.resolve_plugin("fast")
-    del os.environ["CE_DENY_PLUGIN"]
+
+    monkeypatch.delenv("CE_DENY_PLUGIN")
+    clear_env_trust_cache()
 
     # Explicit override should allow untrusted plugin with a UserWarning
     with pytest.warns(UserWarning):
@@ -94,18 +100,15 @@ def test_registry_respects_denylist_on_resolution_and_explicit_override_allows_u
         assert ident == identifier
 
 
-def test_env_var_precedence_for_explanation_selection():
-    mgr = PluginManager(object())
+def test_env_var_precedence_for_explanation_selection(monkeypatch):
     # Global env wins over mode-specific per current manager logic
-    os.environ["CE_EXPLANATION_PLUGIN"] = "global.plugin"
-    os.environ["CE_EXPLANATION_PLUGIN_FACTUAL"] = "mode.plugin"
+    monkeypatch.setenv("CE_EXPLANATION_PLUGIN", "global.plugin")
+    monkeypatch.setenv("CE_EXPLANATION_PLUGIN_FACTUAL", "mode.plugin")
+    mgr = PluginManager(object())
     chain = mgr.build_explanation_chain("factual", "core.explanation.factual")
     # first entry should be the global env value (preferred_identifier selection favors it)
     assert "global.plugin" in chain
     assert chain[0] == "global.plugin"
-    # cleanup
-    del os.environ["CE_EXPLANATION_PLUGIN"]
-    del os.environ["CE_EXPLANATION_PLUGIN_FACTUAL"]
 
 
 def test_explainerhandle_metadata_is_immutable():
@@ -118,3 +121,26 @@ def test_explainerhandle_metadata_is_immutable():
     assert isinstance(meta, (MappingProxyType, dict))
     with pytest.raises(TypeError):
         meta["k"] = "x"
+
+
+@pytest.mark.parametrize(
+    ("preprocessor_metadata", "expected"),
+    [
+        (None, None),
+        ({"feature_map": {"a": 1}}, {"feature_map": {"a": 1}}),
+        ("raw-metadata", {"value": "raw-metadata"}),
+    ],
+)
+def test_explainerhandle_get_preprocessor_state_variants(preprocessor_metadata, expected):
+    class Dummy:
+        pass
+
+    dummy = Dummy()
+    dummy.preprocessor_metadata = preprocessor_metadata
+    handle = ExplainerHandle(dummy, {"k": "v"})
+
+    state = handle.get_preprocessor_state()
+    if expected is None:
+        assert state is None
+    else:
+        assert dict(state) == expected

@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import contextlib
 import logging
-import os
 import sys
 import threading
 import warnings
@@ -34,6 +33,8 @@ from typing import (
     Tuple,
     TypeVar,
 )
+
+from ..core.config_manager import ConfigManager
 
 try:  # pragma: no cover - behaviour varies by environment
     import cachetools
@@ -62,12 +63,16 @@ except:  # noqa: E722
     class _FallbackBase:
         pass
 
-    class LRUCache(OrderedDict):
+    class _CachetoolsLRUCacheFallback(OrderedDict):
         """A minimal LRU cache compatible with cachetools.LRUCache.
 
         Behaviour:
         - `maxsize` limits number of entries and evicts least-recently-used.
         - Accessing an entry moves it to the end (most-recently-used).
+
+        Named distinctly from the public ``LRUCache`` class defined later in
+        this module so that pickle can resolve each class unambiguously via its
+        ``__qualname__``.
         """
 
         def __init__(self, maxsize: int):
@@ -113,7 +118,17 @@ except:  # noqa: E722
             while self.maxsize is not None and len(self) > self.maxsize:
                 self.popitem(last=False)
 
-    class TTLCache(LRUCache):
+        def __reduce__(self):
+            # 3-tuple form: (callable, args, state).
+            # callable(*args) calls __init__ setting self.maxsize; __setstate__ restores items.
+            return (self.__class__, (self.maxsize,), {"_items": list(self.items())})
+
+        def __setstate__(self, state):
+            for k, v in state.get("_items", []):
+                # Bypass LRU eviction/recency logic so the stored order is restored exactly.
+                OrderedDict.__setitem__(self, k, v)
+
+    class _CachetoolsTTLCacheFallback(_CachetoolsLRUCacheFallback):
         """A minimal TTL cache that stores expiry timestamps alongside values."""
 
         def __init__(self, maxsize: int, ttl: float):
@@ -153,15 +168,49 @@ except:  # noqa: E722
             self._expiries.clear()
             super().clear()
 
-    # Expose compatible names expected elsewhere in the module
+        def __reduce__(self):
+            # 3-tuple form so __init__ receives maxsize+ttl; __setstate__ restores items+expiries.
+            return (
+                self.__class__,
+                (self.maxsize, self._ttl),
+                {"_items": list(self.items()), "_expiries": dict(self._expiries)},
+            )
+
+        def __setstate__(self, state):
+            for key, value in state.get("_items", []):
+                # Bypass TTL __setitem__ so stored order and expiries are restored exactly.
+                OrderedDict.__setitem__(self, key, value)
+            self._expiries.update(state.get("_expiries", {}))
+
+    # Expose compatible names expected elsewhere in the module.
+    # Use distinctly-named fallback classes so pickle can resolve them via
+    # __qualname__ without colliding with the public LRUCache/TTLCache defined
+    # later in this file.
     class _CacheModuleShim:
-        LRUCache = LRUCache
-        TTLCache = TTLCache
+        LRUCache = _CachetoolsLRUCacheFallback
+        TTLCache = _CachetoolsTTLCacheFallback
 
     cachetools = _CacheModuleShim()
 import numpy as np
 
 logger = logging.getLogger(__name__)
+
+_cache_config_manager: ConfigManager | None = None
+
+
+def _get_cache_config_manager() -> ConfigManager:
+    """Return the process-level ConfigManager singleton for cache config reads."""
+    global _cache_config_manager
+    if _cache_config_manager is None:
+        _cache_config_manager = ConfigManager.from_sources()
+    return _cache_config_manager
+
+
+def _reset_cache_config_manager_for_testing() -> None:
+    """Reset cached config manager singleton (tests only)."""
+    global _cache_config_manager
+    _cache_config_manager = None
+
 
 # Export monotonic to support legacy shims/tests that reference
 # `calibrated_explanations.cache.cache.monotonic`.
@@ -335,10 +384,16 @@ class CacheConfig:
     size_estimator: Callable[[Any], int] = default_size_estimator
 
     @classmethod
-    def from_env(cls, base: "CacheConfig | None" = None) -> "CacheConfig":
+    def from_env(
+        cls,
+        base: "CacheConfig | None" = None,
+        *,
+        config_manager: ConfigManager | None = None,
+    ) -> "CacheConfig":
         """Merge ``CE_CACHE`` overrides with ``base`` defaults."""
+        mgr = config_manager if config_manager is not None else _get_cache_config_manager()
         cfg = CacheConfig(**(base.__dict__ if base is not None else {}))
-        raw = os.getenv("CE_CACHE")
+        raw = mgr.env("CE_CACHE")
         if not raw:
             return cfg
         tokens = [segment.strip() for segment in raw.split(",") if segment.strip()]
